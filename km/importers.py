@@ -43,7 +43,72 @@ def load_bytes(name: str, data: bytes) -> list[Document]:
         return [Document(stem, "pdf", [{"speaker": None, "text": pdf_text(data)}])]
     if ext == ".docx":
         return [Document(stem, "docx", [{"speaker": None, "text": docx_markdown(data)}])]
-    raise ImportErrorKM(f"不支持 {ext} 文件；支持 .md .txt .tex .html .pdf .docx .json（ChatGPT/Claude 导出）.jsonl（Claude Code 会话）")
+    if ext == ".ipynb":
+        return [Document(stem, "notebook", [{"speaker": None, "text": notebook_markdown(_decode(data))}])]
+    if ext == ".rst":
+        return [Document(stem, "rst", [{"speaker": None, "text": _decode(data)}])]
+    raise ImportErrorKM(f"不支持 {ext} 文件；支持 .md .txt .tex .rst .html .pdf .docx .ipynb .json（ChatGPT/Claude 导出）.jsonl（Claude Code 会话）")
+
+
+# --- a whole folder (say, a code repository's docs) ---------------------------
+
+FOLDER_EXTS = {".md", ".markdown", ".txt", ".tex", ".rst", ".html", ".htm", ".pdf", ".docx", ".ipynb"}
+SKIP_DIRS = {".git", ".hg", ".svn", "node_modules", ".venv", "venv", "__pycache__", "dist", "build",
+             "target", ".next", ".cache", ".idea", ".vscode", ".pytest_cache", ".mypy_cache", "site-packages"}
+
+
+def load_folder(root: str, limit: int = 300, max_bytes: int = 20 * 1024 * 1024) -> tuple[list[Document], list[str]]:
+    """Every supported document under `root`, titled by its path inside it.
+
+    Returns (documents, skipped) where skipped says why each file was left out,
+    so a partial import is never silent.
+    """
+    base = Path(root).expanduser()
+    if not base.is_dir():
+        raise ImportErrorKM(f"{base} 不是文件夹")
+    files = []
+    for path in sorted(base.rglob("*")):
+        rel = path.relative_to(base)
+        if any(part in SKIP_DIRS or part.startswith(".") for part in rel.parts[:-1]):
+            continue
+        if path.is_file() and path.suffix.lower() in FOLDER_EXTS:
+            files.append(path)
+    if not files:
+        raise ImportErrorKM(f"{base} 里没有能导入的文档（{' '.join(sorted(FOLDER_EXTS))}）")
+    docs, skipped = [], []
+    for path in files[:limit]:
+        rel = str(path.relative_to(base))
+        if path.stat().st_size > max_bytes:
+            skipped.append(f"{rel}：超过 {max_bytes // 1024 // 1024}MB")
+            continue
+        try:
+            for d in load_bytes(path.name, path.read_bytes()):
+                d.title = f"{base.name}/{rel}"
+                docs.append(d)
+        except (ImportErrorKM, ValueError, OSError) as exc:
+            skipped.append(f"{rel}：{exc}")
+    if len(files) > limit:
+        skipped.append(f"还有 {len(files) - limit} 个文件超出单次上限 {limit}，没导")
+    return docs, skipped
+
+
+# --- Jupyter notebooks: markdown cells as-is, code cells fenced ---------------
+
+
+def notebook_markdown(text: str) -> str:
+    nb = json.loads(text)
+    lang = ((nb.get("metadata") or {}).get("language_info") or {}).get("name") or "python"
+    out = []
+    for cell in nb.get("cells", []):
+        src = cell.get("source", "")
+        src = "".join(src) if isinstance(src, list) else str(src)
+        if not src.strip():
+            continue
+        if cell.get("cell_type") == "markdown":
+            out.append(src.strip())
+        elif cell.get("cell_type") == "code":
+            out.append(f"```{lang}\n{src.rstrip()}\n```")
+    return "\n\n".join(out)
 
 
 def load_text(text: str, title: str = "") -> Document:

@@ -134,20 +134,20 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(c1["title"], "梯度 $\\nabla$")
         self.s.link_cards(c1["id"], "belongs_to", c2["id"])
         self.assertEqual(self.s.card(c2["id"])["in"], [{"relation": "belongs_to", "id": c1["id"], "title": plain(c1["title"], 120)}])
-        self.assertEqual(self.s.graph()["edges"], [{"from": c1["id"], "to": c2["id"], "relation": "belongs_to"}])
+        self.assertIn({"from": c1["id"], "to": c2["id"], "relation": "belongs_to"}, self.s.graph()["edges"])
         self.assertEqual([c["id"] for c in self.s.cards("优化")], [c2["id"]])
         with self.assertRaises(ValueError):
             self.s.link_cards(c1["id"], "made_up", c2["id"])
         with self.assertRaises(ValueError):
             self.s.link_cards(c1["id"], "related", c1["id"])
-        self.s.unlink_cards(c1["id"], "belongs_to", c2["id"])
-        self.assertEqual(self.s.graph()["edges"], [])
+        self.s.unlink_cards(c1["id"], "belongs_to", c2["id"])  # cut loose → back under the root
+        self.assertIn({"from": c1["id"], "to": self.s.root, "relation": "belongs_to"}, self.s.graph()["edges"])
 
     def test_card_survives_source_deletion(self):
         c = self.s.create_card("t", "b", [self.units[2]["id"]])
         self.s.delete_source(self.sid)
         self.assertEqual(self.s.card(c["id"])["origins"], [])
-        self.assertEqual(self.s.stats(), {"sources": 0, "units": 0, "cards": 1})
+        self.assertEqual(self.s.stats(), {"sources": 0, "units": 0, "cards": 2})  # + the root
 
 
 class StructureTests(unittest.TestCase):
@@ -165,7 +165,7 @@ class StructureTests(unittest.TestCase):
     def test_move_builds_ordered_tree(self):
         self.s.move_card(self.attn, self.root)
         tree = self.s.move_card(self.mask, self.root, before=self.attn)
-        self.assertEqual(self.titles(tree), [("Transformer", [("因果遮罩", []), ("注意力", [])])])
+        self.assertEqual(self.titles(tree), [("知识库", [("Transformer", [("因果遮罩", []), ("注意力", [])])])])
 
     def test_one_parent_only_and_no_cycles(self):
         self.s.move_card(self.attn, self.root)
@@ -174,10 +174,13 @@ class StructureTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.s.move_card(self.mask, self.attn)  # attn is under mask
 
-    def test_deleting_parent_lifts_children_to_top(self):
+    def test_deleting_a_card_puts_its_children_in_its_place(self):
         self.s.move_card(self.attn, self.root)
-        self.s.delete_card(self.root)
-        self.assertEqual(sorted(t for t, _ in self.titles(self.s.tree())), ["因果遮罩", "注意力"])
+        self.s.move_card(self.mask, self.root)
+        self.s.delete_card(self.root)  # "Transformer" was first under the root
+        self.assertEqual(self.titles(self.s.tree()), [("知识库", [("注意力", []), ("因果遮罩", [])])])
+        with self.assertRaises(ValueError):
+            self.s.delete_card(self.s.root)
 
     def test_wikilinks_follow_body_and_renames(self):
         self.s.update_card(self.root, body="见 [[注意力]] 和 [[位置编码|位置]]，代码里的 `[[不算]]`")
@@ -200,10 +203,48 @@ class StructureTests(unittest.TestCase):
         self.s.place_card(self.attn, None, None)
         self.assertEqual({c["id"]: c["x"] for c in self.s.board()["cards"]}[self.attn], None)
 
+    def test_structure_stays_strict_under_random_edits(self):
+        import random
+        from km.store import check_structure
+        rnd = random.Random(7)
+        ids = [self.root, self.attn, self.mask] + [self.s.create_card(f"卡{i}", "x", [])["id"] for i in range(12)]
+        for _ in range(200):
+            a, b = rnd.sample(ids, 2)
+            op = rnd.choice(["move", "move", "link", "unlink", "relink", "delete"])
+            try:
+                if op == "move":
+                    self.s.move_card(a, b, before=rnd.choice(ids + [None]))
+                elif op == "link":
+                    self.s.link_cards(a, "belongs_to", b)
+                elif op == "unlink":
+                    self.s.unlink_cards(a, "belongs_to", b)
+                elif op == "relink":
+                    self.s.link_cards(a, "related", b)
+                    self.s.relink_cards(a, "related", b, "belongs_to")
+                elif len(ids) > 5:
+                    self.s.delete_card(a)
+                    ids.remove(a)
+            except ValueError:
+                pass  # refused cycles / self-links are fine; corruption is not
+            self.assertEqual(check_structure(self.s.structure()), [])
+        data = self.s.structure()
+        self.assertEqual(len(data["structure"]["entries"]), len(ids) + 1)  # + the root
+
+    def test_structure_export_shape(self):
+        self.s.move_card(self.attn, self.root)
+        self.s.link_cards(self.mask, "prerequisite", self.attn)
+        d = self.s.structure()
+        e = d["structure"]["entries"][f"c{self.attn}"]
+        self.assertEqual((e["level"], e["parent"], e["order"]), (2, f"c{self.root}", 0))
+        self.assertEqual(e["path"], [f"c{self.s.root}", f"c{self.root}", f"c{self.attn}"])
+        self.assertIn({"id": f"c{self.mask}-prerequisite-c{self.attn}", "from": f"c{self.mask}",
+                       "to": f"c{self.attn}", "relation": "prerequisite"}, d["refs"])
+        self.assertIn("softmax", d["nodes"][f"c{self.attn}"]["definition"])
+
     def test_relink_changes_kind(self):
         self.s.link_cards(self.mask, "related", self.attn)
         self.s.relink_cards(self.mask, "related", self.attn, "prerequisite")
-        self.assertEqual([l["relation"] for l in self.s.card(self.mask)["out"]], ["prerequisite"])
+        self.assertEqual([l["relation"] for l in self.s.card(self.mask)["out"] if l["relation"] != "belongs_to"], ["prerequisite"])
 
 
 class ApiTests(unittest.TestCase):
@@ -230,13 +271,13 @@ class ApiTests(unittest.TestCase):
 
     def test_flow(self):
         code, made = self.call("POST", "/api/sources", {"text": "第一句。第二句。", "title": "t"})
-        self.assertEqual((code, made[0]["units"]), (200, 2))
-        _, units = self.call("GET", f"/api/sources/{made[0]['id']}/units")
+        self.assertEqual((code, made["sources"][0]["units"]), (200, 2))
+        _, units = self.call("GET", f"/api/sources/{made['sources'][0]['id']}/units")
         code, card = self.call("POST", "/api/cards", {"title": "c", "body": units[0]["text"], "units": [units[0]["id"]]})
         self.assertEqual(code, 200)
         _, other = self.call("POST", "/api/cards", {"title": "d", "body": "x", "units": []})
         code, linked = self.call("POST", "/api/links", {"from": card["id"], "relation": "related", "to": other["id"]})
-        self.assertEqual((code, len(linked["out"])), (200, 1))
+        self.assertEqual((code, [l["relation"] for l in linked["out"]]), (200, ["belongs_to", "related"]))
 
     def test_errors_are_plain_messages(self):
         self.assertEqual(self.call("POST", "/api/sources", {"text": "  "}), (400, {"error": "没有内容可导入"}))

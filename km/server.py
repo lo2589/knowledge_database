@@ -14,7 +14,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from .importers import ImportErrorKM, list_claude_sessions, load_bytes, load_text
+from .importers import Document, ImportErrorKM, list_claude_sessions, load_bytes, load_folder, load_text
+from .repos import Repos
 from .store import CHECKS, RELATIONS, KnowledgeStore
 
 WEB = Path(__file__).parent / "web"
@@ -22,17 +23,33 @@ MAX_BODY = 64 * 1024 * 1024
 
 
 class Api:
-    def __init__(self, store: KnowledgeStore, claude_root: Path | None = None):
-        self.store = store
+    def __init__(self, repos: Repos | KnowledgeStore, claude_root: Path | None = None):
+        # A bare store (tests, embedding) is wrapped so the routes see one shape.
+        self.repos = repos if isinstance(repos, Repos) else _Fixed(repos)
         self.claude_root = claude_root
 
+    @property
+    def store(self) -> KnowledgeStore:
+        return self.repos.store
+
     def route(self, method: str, path: str, query: dict, body: dict):
-        s = self.store
         parts = [p for p in path.split("/") if p][1:]  # drop "api"
         num = lambda i: int(parts[i])
 
+        # Repositories: which knowledge base the rest of the routes act on.
+        if parts == ["repos"] and method == "GET":
+            return self.repos.list()
+        if parts == ["repos"] and method == "POST":
+            return self.repos.create(body.get("name", ""))
+        if parts == ["repos", "open"] and method == "POST":
+            return self.repos.open(body.get("path", ""))
+        if parts == ["repos", "forget"] and method == "POST":
+            return self.repos.forget(body.get("path", ""))
+
+        s = self.store
         if parts == ["meta"]:
-            return {"relations": RELATIONS, "checks": CHECKS, "stats": s.stats()}
+            return {"relations": RELATIONS, "checks": CHECKS, "stats": s.stats(),
+                    "repo": Path(self.repos.path).stem if self.repos.path else ""}
         if parts == ["sources"] and method == "GET":
             return s.sources()
         if parts == ["sources"] and method == "POST":
@@ -53,7 +70,11 @@ class Api:
         if parts == ["cards"] and method == "GET":
             return s.cards(query.get("q", [""])[0])
         if parts == ["cards"] and method == "POST":
-            return s.create_card(body.get("title", ""), body.get("body", ""), [int(x) for x in body.get("units", [])])
+            parent = body.get("parent")
+            return s.create_card(body.get("title", ""), body.get("body", ""), [int(x) for x in body.get("units", [])],
+                                 None if parent is None else int(parent))
+        if parts == ["structure"]:
+            return s.structure()
         if parts == ["tree"]:
             return s.tree()
         if parts == ["board"]:
@@ -86,8 +107,18 @@ class Api:
             return s.graph()
         raise LookupError(f"没有这个接口：{method} {path}")
 
-    def _import(self, body: dict) -> list[dict]:
-        if body.get("claude_session"):
+    def _import(self, body: dict) -> dict:
+        skipped: list[str] = []
+        if body.get("messages"):
+            # Already split into turns by the caller (the dsh plugin): keep speakers.
+            msgs = [{"speaker": m.get("speaker"), "text": str(m.get("text", ""))}
+                    for m in body["messages"] if str(m.get("text", "")).strip()]
+            if not msgs:
+                raise ValueError("没有内容可导入")
+            docs = [Document(body.get("title") or "对话", body.get("format") or "dsh", msgs)]
+        elif body.get("folder"):
+            docs, skipped = load_folder(body["folder"])
+        elif body.get("claude_session"):
             path = Path(body["claude_session"]).expanduser()
             root = (self.claude_root or Path.home() / ".claude" / "projects").resolve()
             if root not in path.resolve().parents or path.suffix != ".jsonl":
@@ -101,7 +132,22 @@ class Api:
             raise ValueError("没有内容可导入")
         if body.get("title") and len(docs) == 1:
             docs[0].title = body["title"]
-        return [self.store.add_document(d) for d in docs]
+        return {"sources": [self.store.add_document(d) for d in docs], "skipped": skipped}
+
+
+class _Fixed:
+    """A single store presented as a repository set of one."""
+
+    def __init__(self, store: KnowledgeStore):
+        self.store, self.path = store, ""
+
+    def list(self) -> dict:
+        return {"home": "", "current": "", "repos": []}
+
+    def create(self, name):
+        raise ValueError("这个实例只有一个库，不能新建仓库")
+
+    open = forget = create
 
 
 def make_handler(api: Api):
@@ -161,9 +207,11 @@ def make_handler(api: Api):
         def do_DELETE(self):
             self._handle("DELETE")
 
+    Handler.api = api
     return Handler
 
 
-def serve(db_path: str, port: int = 8790, claude_root: Path | None = None) -> ThreadingHTTPServer:
-    api = Api(KnowledgeStore(db_path), claude_root)
+def serve(repos_home: str, db_path: str | None = None, port: int = 8790,
+          claude_root: Path | None = None) -> ThreadingHTTPServer:
+    api = Api(Repos(Path(repos_home), Path(db_path) if db_path else None), claude_root)
     return ThreadingHTTPServer(("127.0.0.1", port), make_handler(api))

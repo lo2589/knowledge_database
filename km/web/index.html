@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="km-app" content="known-manage">
 <title>知识整理</title>
 <link rel="stylesheet" href="vendor/katex/katex.min.css">
 <link rel="stylesheet" href="vendor/cdn-assets/styles/github.min.css" id="hl-light">
@@ -15,8 +16,13 @@
   <nav id="tabs">
     <button data-view="sift" class="on">① 拆分与筛选</button>
     <button data-view="cards">② 卡片与链接</button>
-    <button data-view="board">③ 摆放</button>
+    <button data-view="map">③ 层级图</button>
+    <button data-view="board">④ 摆放</button>
   </nav>
+  <div class="repo" id="repo">
+    <button class="repo-btn" id="repo-btn" title="切换 / 新建 / 打开知识仓库"><span id="repo-name">…</span> ▾</button>
+    <div class="repo-menu" id="repo-menu" hidden></div>
+  </div>
   <span class="stats" id="stats"></span>
   <span class="grow"></span>
   <button class="btn primary" id="btn-import">导入</button>
@@ -25,6 +31,7 @@
 <main>
   <!-- ① split & sift -->
   <section class="view on" id="v-sift">
+    <select id="source-pick" class="source-pick"></select>
     <aside class="side">
       <h3>资料</h3>
       <div id="sources"></div>
@@ -33,8 +40,8 @@
       <div class="toolbar" id="sift-bar"></div>
       <div id="units"></div>
     </div>
-    <aside class="side right">
-      <h3>留下的 <span class="hint">勾选几句合成一张卡</span></h3>
+    <aside class="side right" id="kept-panel">
+      <h3 id="kept-head">留下的 <span class="hint">勾选几句合成一张卡</span></h3>
       <div id="kept"></div>
       <div class="row gap">
         <button class="btn primary" id="btn-card-merge">勾选的合成一张卡</button>
@@ -58,7 +65,24 @@
     <aside class="side right" id="card-links"></aside>
   </section>
 
-  <!-- ③ board: you place the cards -->
+  <!-- ③ hierarchy map: the strict tree, foldable, every relation drawn -->
+  <section class="view" id="v-map">
+    <div class="map-wrap">
+      <div class="map-bar">
+        <button class="btn small" id="map-expand">全部展开</button>
+        <button class="btn small" id="map-collapse">全部收起</button>
+        <button class="btn small" id="map-bodies">内容全开/全关</button>
+        <button class="btn small" id="map-fit">适配</button>
+        <button class="btn small" id="map-export" title="导出成严格层级 JSON（knowledge_tree_viewer 能直接加载）">导出 JSON</button>
+        <span class="hint">点 +/− 展开下一级，点 ▾ 展开内容，双击打开编辑</span>
+      </div>
+      <div class="map-stage" id="map-stage"><div class="map-error" id="map-error" hidden></div><div class="layer" id="map-layer"></div></div>
+      <div class="map-legend" id="map-legend"></div>
+    </div>
+    <aside class="side right" id="map-side"></aside>
+  </section>
+
+  <!-- ④ board: you place the cards -->
   <section class="view" id="v-board">
     <aside class="side" id="tray"></aside>
     <div class="stage" id="stage"><div class="layer" id="layer"></div><div class="graph-legend" id="board-legend"></div></div>
@@ -72,6 +96,7 @@
     <div class="tabs2">
       <button data-imp="paste" class="on">粘贴</button>
       <button data-imp="file">文件</button>
+      <button data-imp="folder">文件夹 / 代码仓库</button>
       <button data-imp="claude">Claude Code 会话</button>
     </div>
     <div class="imp" data-imp="paste">
@@ -85,6 +110,11 @@
         <span class="hint">.md .txt .tex .html .pdf .docx · ChatGPT / Claude 导出的 .json · Claude Code 的 .jsonl</span>
       </label>
       <div id="imp-files" class="hint"></div>
+    </div>
+    <div class="imp" data-imp="folder" hidden>
+      <input id="imp-folder" placeholder="文件夹路径，比如 ~/Workspace/WORKSPACE/Node">
+      <div class="hint">把这个文件夹（含子文件夹）里的 .md .txt .tex .rst .html .pdf .docx .ipynb 都导进来，每个文件一份资料。
+        .git、node_modules、.venv、build 这类目录会跳过。</div>
     </div>
     <div class="imp" data-imp="claude" hidden>
       <div id="sessions" class="sessions"></div>

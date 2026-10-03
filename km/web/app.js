@@ -48,6 +48,7 @@
     document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.id === "v-" + view));
     document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.view === view));
     if (view === "cards") loadCards();
+    if (view === "map") drawMap().then(() => { if (!localStorage.getItem("km-map-view")) fitMap(); });
     if (view === "board") drawBoard();
   }
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => show(b.dataset.view));
@@ -55,7 +56,58 @@
   async function refreshStats() {
     const m = await api("GET", "meta");
     $("stats").textContent = `${m.stats.sources} 份资料 · ${m.stats.units} 句 · ${m.stats.cards} 张卡`;
+    if (m.repo) $("repo-name").textContent = m.repo;
   }
+
+  // ------------------------------------------------------- repositories
+  // Each repository is its own FastNode file. Switching reloads everything.
+  async function openRepoMenu() {
+    const menu = $("repo-menu");
+    if (!menu.hidden) { menu.hidden = true; return; }
+    const r = await api("GET", "repos").catch(fail);
+    if (!r) return;
+    menu.innerHTML = `<div class="rm-h">知识仓库 <span class="hint">新仓库放在 ${esc(r.home)}</span></div>`
+      + r.repos.map(x => `<div class="rm-item ${x.current ? "on" : ""}" data-path="${esc(x.path)}" title="${esc(x.path)}">
+          <span>${x.current ? "● " : ""}${esc(x.name)}</span><span class="hint">${(x.size / 1024 | 0)} KB${x.inside_home ? "" : " · 外部"}</span></div>`).join("")
+      + `<div class="rm-sep"></div>
+         <div class="rm-row"><input id="rm-new" placeholder="新仓库名，回车建好并切过去"></div>
+         <div class="rm-row"><input id="rm-open" placeholder="打开已有仓库：.db 文件路径，回车"></div>`;
+    menu.hidden = false;
+    menu.querySelectorAll(".rm-item").forEach(el => el.onclick = () => switchRepo(api("POST", "repos/open", { path: el.dataset.path })));
+    $("rm-new").onkeydown = e => { if (e.key === "Enter") switchRepo(api("POST", "repos", { name: e.target.value })); };
+    $("rm-open").onkeydown = e => { if (e.key === "Enter") switchRepo(api("POST", "repos/open", { path: e.target.value })); };
+  }
+  async function switchRepo(call) {
+    try {
+      const r = await call;
+      $("repo-menu").hidden = true;
+      S.sid = null; S.cardId = null; S.units = []; tree = [];
+      await refreshStats(); await loadSources(); show(S.view);
+      toast("已切到仓库「" + r.repos.find(x => x.current).name + "」");
+    } catch (e) { fail(e); }
+  }
+  $("repo-btn").onclick = openRepoMenu;
+  document.addEventListener("mousedown", e => { if (!e.target.closest("#repo")) $("repo-menu").hidden = true; });
+
+  // ------------------------------------------------- embedding (dsh sidebar)
+  // ?mode=side switches to the narrow layout; ?source=ID opens that source;
+  // ?cwd=PATH pre-fills folder import with the conversation's workspace.
+  const params = new URLSearchParams(location.search);
+  if (params.get("mode") === "side") document.body.classList.add("side");
+  if (params.get("cwd")) $("imp-folder").value = params.get("cwd");
+  if (params.get("source")) { S.sid = +params.get("source"); S.cur = 0; S.view = "sift"; }
+  // The host page (dsh) tells us when it just put something in: show it.
+  window.addEventListener("message", async e => {
+    const d = e.data;
+    if (!d || d.source !== "km-host") return;
+    if (d.type === "open-source" && d.id) {
+      S.sid = +d.id; S.cur = 0; remember();
+      show("sift"); await loadSources(); refreshStats();
+      toast(d.note || "已入库");
+    }
+    if (d.type === "cwd" && d.cwd) $("imp-folder").value = d.cwd;
+  });
+  $("kept-head").onclick = () => document.body.classList.contains("side") && $("kept-panel").classList.toggle("open");
 
   // ---------------------------------------------------------- ① sources
   async function loadSources() {
@@ -65,6 +117,10 @@
     await loadUnits();
   }
   function renderSources() {
+    const pick = $("source-pick");
+    pick.innerHTML = S.sources.length ? S.sources.map(s => `<option value="${s.id}" ${s.id === S.sid ? "selected" : ""}>${esc(s.title)}（留 ${s.counts.kept}）</option>`).join("")
+      : `<option>还没有资料，点「导入」</option>`;
+    pick.onchange = () => { S.sid = +pick.value; S.cur = 0; remember(); renderSources(); loadUnits(); };
     const box = $("sources");
     if (!S.sources.length) { box.innerHTML = `<div class="empty">还没有资料<br>点右上角「导入」</div>`; return; }
     box.innerHTML = S.sources.map(s => `<div class="src ${s.id === S.sid ? "on" : ""}" data-id="${s.id}">
@@ -250,7 +306,7 @@
       await writes;
       const card = editorCtx.cardId
         ? await api("PATCH", "cards/" + editorCtx.cardId, { title, body })
-        : await api("POST", "cards", { title, body, units: editorCtx.units || [] });
+        : await api("POST", "cards", { title, body, units: editorCtx.units || [], parent: editorCtx.parent ?? null });
       $("m-card").classList.remove("on");
       refreshStats();
       if (!editorCtx.cardId) {
@@ -563,7 +619,224 @@
     if (confirm(`还没有「${target}」这张卡，现在建？`)) openEditor({ title: target, body: "" });
   });
 
-  // --------------------------------------------------------- ③ board
+  // --------------------------------------------------------- ③ hierarchy map
+  // The strict tree drawn top-down, mermaid style. Each card folds its
+  // children (+/−) and, separately, its content (formulas render inside the
+  // box). Tree edges are grey; every other relation is drawn too, each kind in
+  // its own colour and toggleable from the legend.
+  const MAP_W = 230, MAP_W_OPEN = 380, MAP_HGAP = 28, MAP_VGAP = 70;
+  const loadSet = (k, dflt) => { try { const v = JSON.parse(localStorage.getItem(k)); return new Set(Array.isArray(v) ? v : dflt); } catch (e) { return new Set(dflt); } };
+  const saveSet = (k, set) => { try { localStorage.setItem(k, JSON.stringify([...set])); } catch (e) {} };
+  let mapOpen = loadSet("km-map-open", []), mapBody = loadSet("km-map-body", []);
+  let mapRel = loadSet("km-map-rel", [...Object.keys(REL).filter(r => r !== "belongs_to"), "mentions"]);
+  let mapView = (() => { try { return JSON.parse(localStorage.getItem("km-map-view")) || { x: 40, y: 30, k: 1 }; } catch (e) { return { x: 40, y: 30, k: 1 }; } })();
+  let mapData = null, mapSel = null;
+  const REL_NAME = { ...Object.fromEntries(Object.entries(REL).map(([k, v]) => [k, k === "belongs_to" ? "属于" : v.out])), mentions: "正文提到" };
+  const REL_DASH = { related: "2 4", mentions: "6 4", contradicts: "" };
+
+  async function drawMap() {
+    const err = $("map-error");
+    try { mapData = await api("GET", "structure"); err.hidden = true; }
+    catch (e) { err.hidden = false; err.textContent = "拒绝渲染（层级结构不合格）：\n" + e.message; return; }
+    const { nodes, structure: { root, entries }, refs } = mapData;
+    if (!mapOpen.size) mapOpen.add(root);
+    if (!mapSel || !nodes[mapSel]) mapSel = root;
+    const kids = id => Object.keys(entries).filter(k => entries[k].parent === id).sort((a, b) => entries[a].order - entries[b].order);
+
+    // what is visible: root, then children of open nodes
+    const visible = [], q = [root];
+    while (q.length) { const id = q.shift(); visible.push(id); if (mapOpen.has(id)) q.push(...kids(id)); }
+
+    // 1. render boxes (unpositioned) so their real heights can be measured
+    const layer = $("map-layer");
+    layer.innerHTML = `<svg id="map-edges"></svg>` + visible.map(id => {
+      const n = nodes[id], ch = kids(id).length, open = mapOpen.has(id), body = mapBody.has(id);
+      return `<div class="mnode ${n.check} ${id === mapSel ? "sel" : ""} ${body ? "wide" : ""} ${n.node_type === "root" ? "root" : ""}" data-id="${id}">
+        <div class="mh">
+          ${ch ? `<button class="mt" data-tog="${id}" title="${open ? "收起下一级" : "展开下一级"}">${open ? "−" : "+"}<span>${ch}</span></button>` : `<span class="mt leaf"></span>`}
+          <span class="dot ${n.check}"></span>
+          <span class="mtitle md" data-t="${id}"></span>
+          <button class="mb" data-body="${id}" title="${body ? "收起内容" : "展开内容"}">${body ? "▴" : "▾"}</button>
+        </div>
+        ${body ? `<div class="mbody md" data-b="${id}"></div>` : ""}
+        <div class="mid">${id} · L${entries[id].level} · #${entries[id].order}</div>
+      </div>`;
+    }).join("");
+    visible.forEach(id => {
+      mount(layer.querySelector(`[data-t="${id}"]`), nodes[id].name, { inline: true });
+      const b = layer.querySelector(`[data-b="${id}"]`);
+      if (b) mount(b, nodes[id].definition);
+    });
+    const box = id => layer.querySelector(`.mnode[data-id="${id}"]`);
+    const width = id => mapBody.has(id) ? MAP_W_OPEN : MAP_W;
+    visible.forEach(id => { box(id).style.width = width(id) + "px"; });
+
+    // 2. tidy top-down layout: each subtree gets the width it needs, a parent
+    //    sits centred over its children, each level starts below the tallest
+    //    box of the level above.
+    const shown = id => mapOpen.has(id) ? kids(id) : [];
+    const subW = new Map();
+    (function measure(id) {
+      const c = shown(id);
+      c.forEach(measure);
+      const cw = c.reduce((a, x) => a + subW.get(x), 0) + Math.max(0, c.length - 1) * MAP_HGAP;
+      subW.set(id, Math.max(width(id), cw));
+    })(root);
+    const levelH = [];
+    visible.forEach(id => { const l = entries[id].level; levelH[l] = Math.max(levelH[l] || 0, box(id).offsetHeight); });
+    const levelY = [0];
+    for (let l = 1; l < levelH.length; l++) levelY[l] = levelY[l - 1] + levelH[l - 1] + MAP_VGAP;
+    const pos = {};
+    (function place(id, x0) {
+      const c = shown(id), y = levelY[entries[id].level];
+      if (!c.length) { pos[id] = { x: x0 + (subW.get(id) - width(id)) / 2, y }; return; }
+      const cw = c.reduce((a, x) => a + subW.get(x), 0) + (c.length - 1) * MAP_HGAP;
+      let x = x0 + (subW.get(id) - cw) / 2;
+      c.forEach(k => { place(k, x); x += subW.get(k) + MAP_HGAP; });
+      const first = pos[c[0]], last = pos[c[c.length - 1]];
+      const mid = (first.x + width(c[0]) / 2 + last.x + width(c[c.length - 1]) / 2) / 2;
+      pos[id] = { x: mid - width(id) / 2, y };
+    })(root, 0);
+    visible.forEach(id => { const b = box(id); b.style.left = pos[id].x + "px"; b.style.top = pos[id].y + "px"; });
+
+    // 3. edges: tree first (grey), then every enabled relation between visible cards
+    const rect = id => ({ x: pos[id].x, y: pos[id].y, w: width(id), h: box(id).offsetHeight });
+    const W = Math.max(...visible.map(id => pos[id].x + width(id))) + 60;
+    const H = Math.max(...visible.map(id => pos[id].y + box(id).offsetHeight)) + 60;
+    const svg = $("map-edges");
+    svg.setAttribute("width", W); svg.setAttribute("height", H);
+    let html = `<defs>${Object.entries({ tree: "#9ca3af", ...REL_COLOR, mentions: "#9ca3af" }).map(([k, c]) =>
+      `<marker id="mk-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="${c}"/></marker>`).join("")}</defs>`;
+    visible.forEach(id => {
+      const p = entries[id].parent;
+      if (!p || !pos[p]) return;
+      const a = rect(p), b = rect(id), x1 = a.x + a.w / 2, y1 = a.y + a.h, x2 = b.x + b.w / 2, y2 = b.y, my = (y1 + y2) / 2;
+      html += `<path d="M${x1},${y1} C${x1},${my} ${x2},${my} ${x2},${y2 - 2}" class="tree-edge" marker-end="url(#mk-tree)"/>`;
+    });
+    const isVis = new Set(visible);
+    const cross = refs.filter(r => mapRel.has(r.relation) && isVis.has(r.from) && isVis.has(r.to));
+    cross.forEach((r, k) => {
+      const a = rect(r.from), b = rect(r.to);
+      const ac = { x: a.x + a.w / 2, y: a.y + a.h / 2 }, bc = { x: b.x + b.w / 2, y: b.y + b.h / 2 };
+      // leave/enter through the facing sides; bow sideways so it does not hide under tree edges
+      const side = bc.x >= ac.x ? 1 : -1;
+      const sameRow = Math.abs(ac.y - bc.y) < 10;
+      const p1 = sameRow ? { x: ac.x, y: a.y + a.h } : { x: side > 0 ? a.x + a.w : a.x, y: ac.y };
+      const p2 = sameRow ? { x: bc.x, y: b.y + b.h + 4 } : { x: side > 0 ? b.x - 4 : b.x + b.w + 4, y: bc.y };
+      const bend = sameRow ? 50 + 12 * (k % 4) : 0;
+      const c1 = sameRow ? { x: p1.x, y: p1.y + bend } : { x: p1.x + side * 60, y: p1.y };
+      const c2 = sameRow ? { x: p2.x, y: p2.y + bend } : { x: p2.x - side * 60, y: p2.y };
+      const color = r.relation === "mentions" ? "#9ca3af" : REL_COLOR[r.relation];
+      const lx = (p1.x + 3 * c1.x + 3 * c2.x + p2.x) / 8, ly = (p1.y + 3 * c1.y + 3 * c2.y + p2.y) / 8;
+      html += `<path d="M${p1.x},${p1.y} C${c1.x},${c1.y} ${c2.x},${c2.y} ${p2.x},${p2.y}" stroke="${color}" class="rel-edge"
+                 stroke-dasharray="${REL_DASH[r.relation] ?? ""}" marker-end="url(#mk-${r.relation})"/>
+               <text x="${lx}" y="${ly}" class="rel-label" fill="${color}">${REL_NAME[r.relation]}</text>`;
+    });
+    svg.innerHTML = html;
+
+    applyMap();
+    renderMapLegend(refs);
+    renderMapSide();
+
+    layer.querySelectorAll("[data-tog]").forEach(b => b.onclick = e => {
+      e.stopPropagation(); const id = b.dataset.tog;
+      mapOpen.has(id) ? mapOpen.delete(id) : mapOpen.add(id); saveSet("km-map-open", mapOpen); drawMap();
+    });
+    layer.querySelectorAll("[data-body]").forEach(b => b.onclick = e => {
+      e.stopPropagation(); const id = b.dataset.body;
+      mapBody.has(id) ? mapBody.delete(id) : mapBody.add(id); saveSet("km-map-body", mapBody); drawMap();
+    });
+    layer.querySelectorAll(".mnode").forEach(el => {
+      el.onclick = e => { if (e.target.closest("a")) return; mapSel = el.dataset.id; layer.querySelectorAll(".mnode").forEach(x => x.classList.toggle("sel", x === el)); renderMapSide(); };
+      el.ondblclick = () => openCard(+el.dataset.id.slice(1));
+    });
+  }
+
+  function applyMap() {
+    $("map-layer").style.transform = `translate(${mapView.x}px,${mapView.y}px) scale(${mapView.k})`;
+    try { localStorage.setItem("km-map-view", JSON.stringify(mapView)); } catch (e) {}
+  }
+  function fitMap() {
+    const layer = $("map-layer"), svg = $("map-edges"), stage = $("map-stage");
+    if (!svg) return;
+    const w = +svg.getAttribute("width"), h = +svg.getAttribute("height");
+    const k = Math.max(0.2, Math.min(1.2, (stage.clientWidth - 40) / w, (stage.clientHeight - 40) / h));
+    mapView = { k, x: (stage.clientWidth - w * k) / 2, y: 20 };
+    applyMap();
+  }
+  function renderMapLegend(refs) {
+    const count = r => refs.filter(x => x.relation === r).length;
+    $("map-legend").innerHTML = `<span class="lg"><i style="background:#9ca3af"></i>层级（上一级→下一级）</span>`
+      + [...Object.keys(REL).filter(r => r !== "belongs_to"), "mentions"].map(r =>
+        `<label class="lg"><input type="checkbox" data-rel="${r}" ${mapRel.has(r) ? "checked" : ""}>
+          <i style="background:${r === "mentions" ? "#9ca3af" : REL_COLOR[r]}"></i>${REL_NAME[r]} <span class="hint">${count(r)}</span></label>`).join("");
+    $("map-legend").querySelectorAll("[data-rel]").forEach(cb => cb.onchange = () => {
+      cb.checked ? mapRel.add(cb.dataset.rel) : mapRel.delete(cb.dataset.rel); saveSet("km-map-rel", mapRel); drawMap();
+    });
+  }
+  function renderMapSide() {
+    const side = $("map-side");
+    if (!mapData || !mapSel) { side.innerHTML = ""; return; }
+    const { nodes, structure: { entries }, refs } = mapData;
+    const n = nodes[mapSel], e = entries[mapSel];
+    const kids = Object.keys(entries).filter(k => entries[k].parent === mapSel).sort((a, b) => entries[a].order - entries[b].order);
+    const link = id => `<a href="#" class="go" data-go="${id}">${esc(nodes[id].name)}</a>`;
+    const out = refs.filter(r => r.from === mapSel), inn = refs.filter(r => r.to === mapSel);
+    side.innerHTML = `<h2 class="md" id="ms-title"></h2><div class="hint">${mapSel} · <span class="badge ${n.check}">${CHECK[n.check] || ""}</span></div>
+      <div class="mcard"><h3>内容</h3><div class="md" id="ms-def"></div></div>
+      <div class="mcard"><h3>层级</h3>
+        <div class="row">level = ${e.level}</div>
+        <div class="row">parent = ${e.parent ? link(e.parent) : "null（根）"}</div>
+        <div class="row">order = ${e.order}</div>
+        <div class="row">path = ${e.path.map(p => link(p)).join(" → ")}</div></div>
+      ${kids.length ? `<div class="mcard"><h3>按顺序的下一级</h3>${kids.map((k, i) => `<div class="row">${i} → ${link(k)}</div>`).join("")}</div>` : ""}
+      ${out.length || inn.length ? `<div class="mcard"><h3>其他关系</h3>
+        ${out.map(r => `<div class="row"><b style="color:${REL_COLOR[r.relation] || "#9ca3af"}">${REL_NAME[r.relation]}</b> → ${link(r.to)}</div>`).join("")}
+        ${inn.map(r => `<div class="row">${link(r.from)} <b style="color:${REL_COLOR[r.relation] || "#9ca3af"}">${REL_NAME[r.relation]}</b> → 这张</div>`).join("")}</div>` : ""}
+      <div class="row gap"><button class="btn small" id="ms-open">打开编辑</button><button class="btn small" id="ms-child">在它下面新建</button></div>`;
+    mount($("ms-title"), n.name, { inline: true });
+    mount($("ms-def"), n.definition);
+    side.querySelectorAll("[data-go]").forEach(a => a.onclick = ev => {
+      ev.preventDefault(); mapSel = a.dataset.go;
+      // make sure the target is visible: open every ancestor
+      entries[mapSel].path.slice(0, -1).forEach(p => mapOpen.add(p)); saveSet("km-map-open", mapOpen); drawMap();
+    });
+    $("ms-open").onclick = () => openCard(+mapSel.slice(1));
+    $("ms-child").onclick = () => openEditor({ title: "", body: "", units: [], parent: +mapSel.slice(1) });
+  }
+  (function wireMap() {
+    const stage = $("map-stage");
+    stage.onpointerdown = e => {
+      if (e.target.closest(".mnode")) return;
+      const sx = e.clientX, sy = e.clientY, vx = mapView.x, vy = mapView.y;
+      stage.setPointerCapture(e.pointerId); stage.classList.add("panning");
+      stage.onpointermove = ev => { mapView.x = vx + ev.clientX - sx; mapView.y = vy + ev.clientY - sy; applyMap(); };
+      stage.onpointerup = () => { stage.onpointermove = stage.onpointerup = null; stage.classList.remove("panning"); };
+    };
+    stage.onwheel = e => {
+      e.preventDefault();
+      const r = stage.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+      const k = Math.max(0.2, Math.min(2.5, mapView.k * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+      mapView.x = mx - (mx - mapView.x) * k / mapView.k; mapView.y = my - (my - mapView.y) * k / mapView.k; mapView.k = k; applyMap();
+    };
+    $("map-expand").onclick = () => { Object.keys(mapData?.structure.entries || {}).forEach(id => mapOpen.add(id)); saveSet("km-map-open", mapOpen); drawMap().then(fitMap); };
+    $("map-collapse").onclick = () => { mapOpen = new Set(mapData ? [mapData.structure.root] : []); mapBody = new Set(); saveSet("km-map-open", mapOpen); saveSet("km-map-body", mapBody); drawMap().then(fitMap); };
+    $("map-bodies").onclick = () => {
+      const vis = [...document.querySelectorAll(".mnode")].map(x => x.dataset.id);
+      const all = vis.every(id => mapBody.has(id));
+      vis.forEach(id => all ? mapBody.delete(id) : mapBody.add(id)); saveSet("km-map-body", mapBody); drawMap();
+    };
+    $("map-fit").onclick = fitMap;
+    $("map-export").onclick = async () => {
+      const d = await api("GET", "structure").catch(fail);
+      if (!d) return;
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([JSON.stringify(d, null, 2)], { type: "application/json" }));
+      a.download = "knowledge_tree.json"; a.click();
+    };
+  })();
+
+  // --------------------------------------------------------- ④ board
   // You place the cards. Positions are saved; nothing is laid out for you.
   const BW = 230;
   let boardView = JSON.parse(localStorage.getItem("km-board") || '{"x":40,"y":40,"k":1}');
@@ -688,20 +961,26 @@
     $("imp-go").disabled = true; $("imp-go").textContent = "导入中…";
     try {
       let made = [];
-      if (impMode === "paste") made = await api("POST", "sources", { text: $("imp-text").value, title: $("imp-title").value });
+      let skipped = [];
+      const take = r => { made = made.concat(r.sources); skipped = skipped.concat(r.skipped || []); };
+      if (impMode === "paste") take(await api("POST", "sources", { text: $("imp-text").value, title: $("imp-title").value }));
       else if (impMode === "file") {
         if (!impFiles.length) throw new Error("先选文件");
-        for (const f of impFiles) made = made.concat(await api("POST", "sources", { filename: f.name, file_b64: await b64(f) }));
+        for (const f of impFiles) take(await api("POST", "sources", { filename: f.name, file_b64: await b64(f) }));
+      } else if (impMode === "folder") {
+        if (!$("imp-folder").value.trim()) throw new Error("先填文件夹路径");
+        take(await api("POST", "sources", { folder: $("imp-folder").value.trim() }));
       } else {
         if (!impSession) throw new Error("先选一个会话");
-        made = await api("POST", "sources", { claude_session: impSession });
+        take(await api("POST", "sources", { claude_session: impSession }));
       }
+      if (skipped.length) setTimeout(() => alert("这些没导进来：\n" + skipped.join("\n")), 300);
       $("m-import").classList.remove("on");
       $("imp-text").value = ""; $("imp-title").value = ""; impFiles = []; $("imp-files").textContent = "";
       S.sid = made[0].id; S.cur = 0; remember();
       show("sift");
       await loadSources(); refreshStats();
-      toast(`拆成了 ${made.reduce((a, m) => a + m.units, 0)} 句，用 J/K 往下看，Y 留下`);
+      toast(`${made.length > 1 ? made.length + " 份资料，" : ""}拆成了 ${made.reduce((a, m) => a + m.units, 0)} 句，用 J/K 往下看，Y 留下`);
     } catch (e) { $("imp-err").textContent = e.message; }
     finally { $("imp-go").disabled = false; $("imp-go").textContent = "导入并拆分"; }
   };
@@ -732,5 +1011,5 @@
 
   // --------------------------------------------------------- start
   refreshStats().catch(fail);
-  loadSources().then(() => show(["sift", "cards", "board"].includes(S.view) ? S.view : "sift")).catch(fail);
+  loadSources().then(() => show(["sift", "cards", "map", "board"].includes(S.view) ? S.view : "sift")).catch(fail);
 })();

@@ -72,9 +72,12 @@ def plain(md: str, limit: int = 80) -> str:
 
 
 class KnowledgeStore:
-    def __init__(self, path: str):
+    def __init__(self, path: str, root_title: str = "知识库"):
         self.db = fastnode.Store(path)
         self.lock = threading.Lock()
+        with self.lock:
+            self.root = self._ensure_root(root_title)
+            self._adopt_orphans()
 
     # --- sources and units -------------------------------------------------
 
@@ -183,12 +186,15 @@ class KnowledgeStore:
 
     # --- cards -------------------------------------------------------------
 
-    def create_card(self, title: str, body: str, unit_ids: list[int]) -> dict:
+    def create_card(self, title: str, body: str, unit_ids: list[int], parent: int | None = None) -> dict:
+        """New card, filed as the last child of `parent` (default: the root)."""
         if not body.strip():
             raise ValueError("卡片内容不能为空")
         with self.lock:
             for uid in unit_ids:
                 self._need(uid, "unit")
+            parent = self.root if parent is None else parent
+            self._need(parent, "card")
             t = now_ms()
             title = title.strip() or plain(body, 40)
             cid = self.db.create({"type": "card", "summary": plain(title, 120),
@@ -196,6 +202,8 @@ class KnowledgeStore:
             for uid in unit_ids:
                 self.db.link(cid, "from_unit", uid)
                 self.db.patch(uid, {"attrs": {"status": "kept"}})
+            self.db.link(cid, PARENT, parent)
+            self.db.patch(cid, {"attrs": {"pos": len(self._children(parent)) - 1}})
             self._sync_mentions(cid, body)
             self._resolve_dangling(title)
             return self._card(cid)
@@ -222,9 +230,21 @@ class KnowledgeStore:
             return self._card(cid)
 
     def delete_card(self, cid: int) -> None:
+        """Delete a card; its children take its place under its parent, in order."""
         with self.lock:
             self._need(cid, "card")
+            if cid == self.root:
+                raise ValueError("根节点不能删")
+            parent = self._parent_of(cid)
+            siblings = [c["id"] for c in self._children(parent)]
+            kids = [c["id"] for c in self._children(cid)]
+            at = siblings.index(cid)
+            order = siblings[:at] + kids + siblings[at + 1:]
             self.db.delete(cid)
+            for k in kids:
+                self.db.link(k, PARENT, parent)
+            for i, x in enumerate(order):
+                self.db.patch(x, {"attrs": {"pos": i}})
 
     def card(self, cid: int) -> dict:
         with self.lock:
@@ -257,32 +277,46 @@ class KnowledgeStore:
             self._need(a, "card")
             self._need(b, "card")
             if relation == PARENT:
-                self._set_parent(a, b)
+                self._move(a, b)
             else:
                 self.db.link(a, relation, b)
             return self._card(a)
 
     def unlink_cards(self, a: int, relation: str, b: int) -> dict:
         with self.lock:
-            self.db.unlink(a, relation, b)
+            if relation == PARENT:
+                # Never leave a card hanging: cutting it from its parent files it under the root.
+                if self._parent_of(a) == b and b != self.root:
+                    self._move(a, self.root)
+            else:
+                self.db.unlink(a, relation, b)
             return self._card(a)
 
     # --- hierarchy, placement, checking -------------------------------------
 
     def move_card(self, cid: int, parent: int | None, before: int | None = None) -> list[dict]:
-        """Put a card under `parent` (None = top level), just before sibling `before`
-        (None = last). This is the drag-and-drop in the tree."""
+        """Put a card under `parent` (None = the root), just before sibling `before`
+        (None = last). This is the drag-and-drop in the tree. Both the old and
+        the new sibling lists are renumbered 0..n-1, so orders never collide."""
         with self.lock:
-            self._need(cid, "card")
-            if parent is not None:
-                self._need(parent, "card")
-            self._set_parent(cid, parent)
-            siblings = [c for c in self._children(parent) if c["id"] != cid]
-            ids = [c["id"] for c in siblings]
-            ids.insert(ids.index(before) if before in ids else len(ids), cid)
-            for k, sid in enumerate(ids):
+            return self._move(cid, parent, before)
+
+    def _move(self, cid: int, parent: int | None, before: int | None = None) -> list[dict]:
+        """move_card without taking the lock (callers already hold it)."""
+        self._need(cid, "card")
+        parent = self.root if parent is None else parent
+        self._need(parent, "card")
+        old = self._parent_of(cid)
+        self._set_parent(cid, parent)
+        if old is not None and old != parent:
+            for k, sid in enumerate(c["id"] for c in self._children(old)):
                 self.db.patch(sid, {"attrs": {"pos": k}})
-            return self._tree()
+        siblings = [c for c in self._children(parent) if c["id"] != cid]
+        ids = [c["id"] for c in siblings]
+        ids.insert(ids.index(before) if before in ids else len(ids), cid)
+        for k, sid in enumerate(ids):
+            self.db.patch(sid, {"attrs": {"pos": k}})
+        return self._tree()
 
     def tree(self) -> list[dict]:
         with self.lock:
@@ -322,6 +356,9 @@ class KnowledgeStore:
         return ups[0] if ups else None
 
     def _set_parent(self, cid: int, parent: int | None) -> None:
+        if cid == self.root:
+            raise ValueError("根节点不能挂到别处")
+        parent = self.root if parent is None else parent
         if parent == cid:
             raise ValueError("卡片不能挂在自己下面")
         up = parent
@@ -336,21 +373,78 @@ class KnowledgeStore:
             self.db.link(cid, PARENT, parent)
 
     def _children(self, parent: int | None) -> list[dict]:
-        if parent is None:
-            res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "card"},
-                                 "include_data": True, "limit": 100000})
-            nodes = [n for n in res["nodes"] if self._parent_of(n["id"]) is None]
-        else:
-            ids = [l["id"] for l in self._links(parent)["in"] if l["relation"] == PARENT]
-            nodes = [self.db.get(i, links="none") for i in ids]
+        parent = self.root if parent is None else parent
+        ids = [l["id"] for l in self._links(parent)["in"] if l["relation"] == PARENT]
+        nodes = [self.db.get(i, links="none") for i in ids]
         nodes.sort(key=lambda n: (n["attrs"].get("pos", 1e9), n["attrs"]["created"]))
         return [{"id": n["id"], **n["attrs"]} for n in nodes]
 
     def _tree(self) -> list[dict]:
+        """The whole tree as one root node in a list (kept a list for callers)."""
         def build(parent):
             return [{"id": c["id"], "title": c["title"], "check": c.get("check", "unchecked"),
                      "children": build(c["id"])} for c in self._children(parent)]
-        return build(None)
+        r = self.db.get(self.root, links="none")["attrs"]
+        return [{"id": self.root, "title": r["title"], "check": r.get("check", "unchecked"),
+                 "root": True, "children": build(self.root)}]
+
+    def structure(self) -> dict:
+        """The tree in the strict form (single root; parent, level, order and
+        path for every card) plus the non-tree relations, as knowledge-tree
+        viewers expect it. Raises if the stored tree breaks those rules."""
+        with self.lock:
+            entries, nodes, refs = {}, {}, []
+            key = lambda i: f"c{i}"
+
+            def walk(cid, parent, level, path):
+                n = self.db.get(cid, links="none")
+                a = n["attrs"]
+                path = path + [key(cid)]
+                nodes[key(cid)] = {"id": key(cid), "name": a["title"], "definition": a["body"],
+                                   "node_type": "root" if cid == self.root else "card",
+                                   "check": a.get("check", "unchecked")}
+                kids = self._children(cid)
+                entries[key(cid)] = {"parent": None if parent is None else key(parent), "level": level,
+                                     "order": a.get("pos", 0) if parent is not None else 0, "path": path}
+                for c in kids:
+                    walk(c["id"], cid, level + 1, path)
+
+            walk(self.root, None, 0, [])
+            for nid in list(nodes):
+                for l in self._links(int(nid[1:]))["out"]:
+                    if (l["relation"] in RELATIONS and l["relation"] != PARENT) or l["relation"] == MENTIONS:
+                        refs.append({"id": f"{nid}-{l['relation']}-c{l['id']}", "from": nid,
+                                     "to": key(l["id"]), "relation": l["relation"]})
+            data = {"root": key(self.root), "nodes": nodes,
+                    "structure": {"root": key(self.root), "entries": entries}, "refs": refs,
+                    "partners": [], "qa": [], "flows": {}}
+            problems = check_structure(data)
+            if problems:
+                raise ValueError("层级结构不合格：" + "；".join(problems))
+            return data
+
+    def _ensure_root(self, title: str) -> int:
+        ids = self.db.query({"predicate": {"op": "eq", "field": "/root", "value": True}, "limit": 2})["ids"]
+        if ids:
+            return ids[0]
+        t = now_ms()
+        return self.db.create({"type": "card", "summary": title,
+                               "attrs": {"title": title, "body": "这个仓库所有知识的根。", "root": True,
+                                         "created": t, "updated": t, "pos": 0}})
+
+    def _adopt_orphans(self) -> None:
+        """Every card but the root hangs somewhere; ones that do not (older
+        libraries, deletes elsewhere) are filed at the end of the root."""
+        res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "card"},
+                             "include_data": True, "limit": 100000})
+        loose = sorted((n for n in res["nodes"] if n["id"] != self.root and self._parent_of(n["id"]) is None),
+                       key=lambda n: (n["attrs"].get("pos", 1e9), n["attrs"]["created"]))
+        if not loose:
+            return
+        base = len(self._children(self.root))
+        for i, n in enumerate(loose):
+            self.db.link(n["id"], PARENT, self.root)
+            self.db.patch(n["id"], {"attrs": {"pos": base + i}})
 
     def relink_cards(self, a: int, relation: str, b: int, new_relation: str) -> dict:
         """Change what kind of relation an existing link is."""
@@ -359,9 +453,12 @@ class KnowledgeStore:
         with self.lock:
             if not any(l["relation"] == relation and l["id"] == b for l in self._links(a)["out"]):
                 raise KeyError("这条关系不存在")
-            self.db.unlink(a, relation, b)
+            if relation == PARENT:
+                self._move(a, self.root)  # the old parent link becomes something else
+            else:
+                self.db.unlink(a, relation, b)
             if new_relation == PARENT:
-                self._set_parent(a, b)
+                self._move(a, b)
             else:
                 self.db.link(a, new_relation, b)
             return self._card(a)
@@ -473,3 +570,41 @@ class KnowledgeStore:
 
 def _cjk_end(text: str) -> bool:
     return bool(text) and ("　" <= text[-1] <= "鿿" or "＀" <= text[-1] <= "￯")
+
+
+def check_structure(d: dict) -> list[str]:
+    """The same rules a strict knowledge-tree viewer enforces before it draws."""
+    errs, nodes = [], d.get("nodes", {})
+    entries, root = d["structure"]["entries"], d["structure"]["root"]
+    if root not in nodes or root not in entries:
+        errs.append("ROOT_MISSING")
+    elif entries[root]["parent"] is not None:
+        errs.append("ROOT_PARENT_NOT_NULL")
+    for nid, e in entries.items():
+        if nid not in nodes:
+            errs.append(f"STRUCTURE_NODE_MISSING {nid}")
+        if nid != root and e["parent"] not in entries:
+            errs.append(f"PARENT_MISSING {nid}")
+        seen, chain, cur = set(), [], nid
+        while cur is not None:
+            if cur in seen:
+                errs.append(f"CYCLE {nid}")
+                break
+            seen.add(cur)
+            chain.append(cur)
+            cur = entries.get(cur, {}).get("parent")
+        path = list(reversed(chain))
+        if e["level"] != len(path) - 1:
+            errs.append(f"LEVEL_MISMATCH {nid}")
+        if e["path"] != path:
+            errs.append(f"PATH_MISMATCH {nid}")
+    buckets: dict = {}
+    for nid, e in entries.items():
+        buckets.setdefault(e["parent"], []).append(e["order"])
+    for p, orders in buckets.items():
+        if len(set(orders)) != len(orders):
+            errs.append(f"DUPLICATE_SIBLING_ORDER {p}")
+    for r in d.get("refs", []):
+        if r["from"] not in nodes or r["to"] not in nodes:
+            errs.append(f"BROKEN_REF {r.get('id', '')}")
+    return errs
