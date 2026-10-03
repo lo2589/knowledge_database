@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>知识整理</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="vendor/cdn-assets/styles/github.min.css" id="hl-light">
+<link rel="stylesheet" href="vendor/cdn-assets/styles/github-dark.min.css" id="hl-dark" disabled>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <strong class="brand">知识整理</strong>
+  <nav id="tabs">
+    <button data-view="sift" class="on">① 拆分与筛选</button>
+    <button data-view="cards">② 卡片与链接</button>
+    <button data-view="graph">③ 关系图</button>
+  </nav>
+  <span class="stats" id="stats"></span>
+  <span class="grow"></span>
+  <button class="btn primary" id="btn-import">导入</button>
+</header>
+
+<main>
+  <!-- ① split & sift -->
+  <section class="view on" id="v-sift">
+    <aside class="side">
+      <h3>资料</h3>
+      <div id="sources"></div>
+    </aside>
+    <div class="center" id="units-wrap">
+      <div class="toolbar" id="sift-bar"></div>
+      <div id="units"></div>
+    </div>
+    <aside class="side right">
+      <h3>留下的 <span class="hint">勾选几句合成一张卡</span></h3>
+      <div id="kept"></div>
+      <div class="row gap">
+        <button class="btn primary" id="btn-card-merge">勾选的合成一张卡</button>
+        <button class="btn" id="btn-card-each">每句一张卡</button>
+      </div>
+      <div class="keys">
+        <kbd>J</kbd><kbd>K</kbd> 上下　<kbd>Y</kbd> 留　<kbd>X</kbd> 扔<br>
+        <kbd>E</kbd> 改这句　<kbd>M</kbd> 和上一句合并<br>
+        <kbd>C</kbd> 把这句做成卡片
+      </div>
+    </aside>
+  </section>
+
+  <!-- ② cards & links -->
+  <section class="view" id="v-cards">
+    <aside class="side">
+      <input class="search" id="card-q" placeholder="搜卡片…">
+      <div id="card-list"></div>
+    </aside>
+    <div class="center" id="card-detail"></div>
+    <aside class="side right" id="card-links"></aside>
+  </section>
+
+  <!-- ③ graph -->
+  <section class="view" id="v-graph">
+    <div class="center full"><svg id="graph"></svg><div class="graph-legend" id="graph-legend"></div></div>
+  </section>
+</main>
+
+<!-- import dialog -->
+<div class="modal" id="m-import">
+  <div class="dialog wide">
+    <h2>导入资料</h2>
+    <div class="tabs2">
+      <button data-imp="paste" class="on">粘贴</button>
+      <button data-imp="file">文件</button>
+      <button data-imp="claude">Claude Code 会话</button>
+    </div>
+    <div class="imp" data-imp="paste">
+      <input id="imp-title" placeholder="标题（可不填）">
+      <textarea id="imp-text" placeholder="粘贴对话、文章、网页内容……支持 Markdown、公式（$…$、$$…$$、\(…\)、\[…\]）、代码、表格"></textarea>
+    </div>
+    <div class="imp" data-imp="file" hidden>
+      <label class="drop" id="drop">
+        <input type="file" id="imp-file" multiple hidden>
+        把文件拖到这里，或点击选择<br>
+        <span class="hint">.md .txt .tex .html .pdf .docx · ChatGPT / Claude 导出的 .json · Claude Code 的 .jsonl</span>
+      </label>
+      <div id="imp-files" class="hint"></div>
+    </div>
+    <div class="imp" data-imp="claude" hidden>
+      <div id="sessions" class="sessions"></div>
+    </div>
+    <div class="err" id="imp-err"></div>
+    <div class="row end gap">
+      <button class="btn" data-close>取消</button>
+      <button class="btn primary" id="imp-go">导入并拆分</button>
+    </div>
+  </div>
+</div>
+
+<!-- card editor -->
+<div class="modal" id="m-card">
+  <div class="dialog wide">
+    <h2 id="card-ed-h">新卡片</h2>
+    <input id="card-ed-title" placeholder="标题：用一句话说清这张卡讲什么（可不填）">
+    <div class="editor">
+      <textarea id="card-ed-body" placeholder="内容，支持 Markdown 和公式"></textarea>
+      <div class="md preview" id="card-ed-preview"></div>
+    </div>
+    <div class="err" id="card-ed-err"></div>
+    <div class="row end gap">
+      <button class="btn" data-close>取消</button>
+      <button class="btn primary" id="card-ed-save">存入 <kbd>⌘↵</kbd></button>
+    </div>
+  </div>
+</div>
+
+<script src="vendor/markdown-it/markdown-it.min.js"></script>
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/katex/contrib/mhchem.min.js"></script>
+<script src="vendor/dompurify/purify.min.js"></script>
+<script src="vendor/cdn-assets/highlight.min.js"></script>
+<script src="render.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
