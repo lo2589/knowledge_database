@@ -48,7 +48,7 @@
     document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.id === "v-" + view));
     document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.view === view));
     if (view === "cards") loadCards();
-    if (view === "graph") drawGraph();
+    if (view === "board") drawBoard();
   }
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => show(b.dataset.view));
 
@@ -243,6 +243,7 @@
   let pvTimer;
   function preview() { clearTimeout(pvTimer); pvTimer = setTimeout(() => mount($("card-ed-preview"), $("card-ed-body").value), 120); }
   $("card-ed-body").oninput = preview;
+  attachWikiComplete($("card-ed-body"), preview);
   async function saveCard() {
     const title = $("card-ed-title").value, body = $("card-ed-body").value;
     try {
@@ -255,89 +256,237 @@
       if (!editorCtx.cardId) {
         S.checked = new Set();
         if (S.sid) await loadUnits();
-        S.cardId = card.id;
+        S.cardId = card.id; S.editingCard = false;
         show("cards");
-        toast("存好了。现在想想：它跟哪张卡有关？");
+        toast("存好了。它该挂在哪张卡下面？跟谁有关？");
         setTimeout(() => $("link-q")?.focus(), 300);
-      } else { S.cardId = card.id; loadCards(); }
+      } else { S.cardId = card.id; if (S.view === "cards") loadCards(); else show("cards"); }
     } catch (e) { $("card-ed-err").textContent = e.message; }
   }
   $("card-ed-save").onclick = saveCard;
   $("m-card").addEventListener("keydown", e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); saveCard(); } });
 
   // --------------------------------------------------------- ② cards
+  // Left: your hierarchy (drag to re-file). Middle: the card, edited in place.
+  // Right: did it check out, and how it relates to other cards.
+  const CHECK = { unchecked: "未核对", ok: "对", fixed: "改正过", doubt: "存疑", wrong: "错" };
+  let tree = [], collapsed = new Set(JSON.parse(localStorage.getItem("km-collapsed") || "[]"));
   let qTimer;
   $("card-q").oninput = () => { clearTimeout(qTimer); qTimer = setTimeout(loadCards, 150); };
+
   async function loadCards() {
-    S.cards = await api("GET", "cards?q=" + encodeURIComponent($("card-q").value));
-    if (!S.cardId && S.cards.length) S.cardId = S.cards[0].id;
-    renderCardList();
+    const q = $("card-q").value.trim();
+    if (q) {
+      S.cards = await api("GET", "cards?q=" + encodeURIComponent(q));
+      renderSearch();
+    } else {
+      tree = await api("GET", "tree");
+      renderTree();
+    }
+    if (!S.cardId) S.cardId = q ? (S.cards[0] || {}).id : (tree[0] || {}).id;
     await renderCard();
   }
-  function renderCardList() {
+  function renderSearch() {
     const box = $("card-list");
-    if (!S.cards.length) { box.innerHTML = `<div class="empty">${$("card-q").value ? "没搜到" : "还没有卡片<br>先去 ① 留几句，做成卡"}</div>`; return; }
-    box.innerHTML = S.cards.map(c => `<div class="card-item ${c.id === S.cardId ? "on" : ""}" data-id="${c.id}">
-        <div class="t">${esc(c.title)}</div><div class="p md"></div>
-        <div class="d">${c.degree ? `${c.degree} 条关系` : "<span style='color:var(--drop)'>还没连</span>"} · ${ago(c.updated)}</div></div>`).join("");
+    box.innerHTML = S.cards.length ? S.cards.map(c => `<div class="card-item ${c.id === S.cardId ? "on" : ""}" data-id="${c.id}">
+        <div class="t md"></div><div class="p md"></div></div>`).join("") : `<div class="empty">没搜到</div>`;
     box.querySelectorAll(".card-item").forEach((el, k) => {
-      // Rendered, not stripped: a preview full of raw $\theta$ is unreadable.
+      mount(el.querySelector(".t"), S.cards[k].title, { inline: true });
       mount(el.querySelector(".p"), S.cards[k].body);
-      el.onclick = () => { S.cardId = +el.dataset.id; remember(); renderCardList(); renderCard(); };
+      el.onclick = () => openCard(+el.dataset.id);
     });
   }
+  function renderTree() {
+    const box = $("card-list");
+    if (!tree.length) { box.innerHTML = `<div class="empty">还没有卡片<br>先去 ① 留几句，做成卡</div>`; return; }
+    const row = (n, depth) => `<div class="tnode" data-id="${n.id}">
+        <div class="trow ${n.id === S.cardId ? "on" : ""}" draggable="true" data-id="${n.id}" style="padding-left:${6 + depth * 16}px">
+          <span class="tw">${n.children.length ? (collapsed.has(n.id) ? "▸" : "▾") : ""}</span>
+          <span class="dot ${n.check}" title="${CHECK[n.check]}"></span>
+          <span class="tt md" data-title="${n.id}"></span>
+          ${n.children.length ? `<span class="tc">${n.children.length}</span>` : ""}
+        </div>
+        ${n.children.length && !collapsed.has(n.id) ? n.children.map(c => row(c, depth + 1)).join("") : ""}</div>`;
+    box.innerHTML = tree.map(n => row(n, 0)).join("") + `<div class="troot" id="troot">拖到这里 → 放到最顶层</div>`;
+    const titles = new Map(); (function walk(ns) { ns.forEach(n => { titles.set(n.id, n.title); walk(n.children); }); })(tree);
+    box.querySelectorAll("[data-title]").forEach(el => mount(el, titles.get(+el.dataset.title), { inline: true }));
+    box.querySelectorAll(".trow").forEach(el => {
+      const id = +el.dataset.id;
+      el.onclick = e => {
+        if (e.target.classList.contains("tw") && e.target.textContent) {
+          collapsed.has(id) ? collapsed.delete(id) : collapsed.add(id);
+          localStorage.setItem("km-collapsed", JSON.stringify([...collapsed]));
+          return renderTree();
+        }
+        openCard(id);
+      };
+      el.ondragstart = e => { e.dataTransfer.setData("text/km-card", String(id)); e.dataTransfer.effectAllowed = "move"; };
+      el.ondragover = e => {
+        e.preventDefault();
+        const r = el.getBoundingClientRect(), y = (e.clientY - r.top) / r.height;
+        el.dataset.drop = y < 0.28 ? "before" : y > 0.72 ? "after" : "inside";
+      };
+      el.ondragleave = () => delete el.dataset.drop;
+      el.ondrop = async e => {
+        e.preventDefault();
+        const where = el.dataset.drop; delete el.dataset.drop;
+        const moving = +e.dataTransfer.getData("text/km-card");
+        if (!moving || moving === id) return;
+        const { parent, siblings } = locate(id);
+        let body;
+        if (where === "inside") { body = { parent: id, before: null }; collapsed.delete(id); }
+        else if (where === "before") body = { parent, before: id };
+        else { const k = siblings.findIndex(s => s.id === id); const next = siblings.slice(k + 1).find(s => s.id !== moving); body = { parent, before: next ? next.id : null }; }
+        try { tree = await api("POST", `cards/${moving}/move`, body); renderTree(); if (S.cardId === moving || S.cardId === id) renderCard(); }
+        catch (err) { fail(err); }
+      };
+    });
+    const root = $("troot");
+    root.ondragover = e => { e.preventDefault(); root.classList.add("over"); };
+    root.ondragleave = () => root.classList.remove("over");
+    root.ondrop = async e => {
+      e.preventDefault(); root.classList.remove("over");
+      const moving = +e.dataTransfer.getData("text/km-card");
+      if (moving) { tree = await api("POST", `cards/${moving}/move`, { parent: null, before: null }).catch(fail); renderTree(); renderCard(); }
+    };
+  }
+  // Where a card sits in the tree: its parent id and its sibling list.
+  function locate(id, nodes = tree, parent = null) {
+    for (const n of nodes) {
+      if (n.id === id) return { parent, siblings: nodes };
+      const hit = locate(id, n.children, n.id);
+      if (hit) return hit;
+    }
+    return null;
+  }
+  function ancestors(id) {
+    const path = [];
+    let hit = locate(id);
+    while (hit && hit.parent != null) {
+      const p = hit.parent;
+      const node = (function find(ns) { for (const n of ns) { if (n.id === p) return n; const f = find(n.children); if (f) return f; } return null; })(tree);
+      path.unshift(node);
+      hit = locate(p);
+    }
+    return path;
+  }
+  function openCard(id) {
+    S.cardId = id; S.editingCard = false; remember();
+    if (S.view !== "cards") return show("cards");
+    $("card-q").value ? renderSearch() : renderTree();
+    renderCard();
+  }
+
   async function renderCard() {
     const box = $("card-detail"), side = $("card-links");
     if (!S.cardId) { box.innerHTML = `<div class="empty">选一张卡</div>`; side.innerHTML = ""; return; }
     let c;
     try { c = await api("GET", "cards/" + S.cardId); }
     catch (e) { S.cardId = null; box.innerHTML = `<div class="empty">这张卡不在了</div>`; side.innerHTML = ""; return; }
+    if (!tree.length) tree = await api("GET", "tree");
+    S.card = c;
+    if (S.editingCard) return renderCardEditor(c);
+    const path = ancestors(c.id);
+    const kids = (locate(c.id) ? (function find(ns) { for (const n of ns) { if (n.id === c.id) return n.children; const f = find(n.children); if (f) return f; } return []; })(tree) : []);
     box.innerHTML = `<div class="card-view">
+        <div class="crumbs">${path.length ? path.map(p => `<a href="#" data-go="${p.id}" class="md" data-crumb="${p.id}"></a>`).join(" › ") + " ›" : "<span class='hint'>最顶层</span>"}</div>
         <h1 class="md" id="cv-title"></h1>
-        <div class="meta"><span>改于 ${ago(c.updated)}</span>
-          <button class="btn small" id="cv-edit">编辑</button><button class="btn small ghost" id="cv-del">删除</button></div>
+        <div class="meta"><span class="badge ${c.check}">${CHECK[c.check]}</span><span>改于 ${ago(c.updated)}</span>
+          <button class="btn small" id="cv-edit">编辑 <kbd>E</kbd></button><button class="btn small ghost" id="cv-del">删除</button></div>
         <div class="md body" id="cv-body"></div>
+        ${kids.length ? `<div class="kids"><h4>下一级</h4>${kids.map(k => `<div class="kid-item" data-go="${k.id}"><span class="dot ${k.check}"></span><span class="md" data-kid="${k.id}"></span></div>`).join("")}</div>` : ""}
+        ${c.mentions_in.length ? `<div class="kids"><h4>哪些卡在正文里提到了它</h4>${c.mentions_in.map(k => `<div class="kid-item" data-go="${k.id}">${esc(k.title)}</div>`).join("")}</div>` : ""}
         ${c.origins.length ? `<div class="origins"><h4>来自原文（点击回到原处）</h4>${c.origins.map(o =>
           `<div class="origin" data-src="${o.source}" data-unit="${o.unit}"><div class="md"></div><div class="s">— ${esc(o.source_title)}</div></div>`).join("")}</div>` : ""}
       </div>`;
+    path.forEach(p => mount(box.querySelector(`[data-crumb="${p.id}"]`), p.title, { inline: true }));
+    kids.forEach(k => mount(box.querySelector(`[data-kid="${k.id}"]`), k.title, { inline: true }));
     mount($("cv-title"), c.title, { inline: true });
-    mount($("cv-body"), c.body);
+    mount($("cv-body"), c.body, { refs: c.refs });
+    box.querySelectorAll("[data-go]").forEach(el => el.onclick = e => { e.preventDefault(); openCard(+el.dataset.go); });
     box.querySelectorAll(".origin").forEach((el, k) => {
       mount(el.querySelector(".md"), c.origins[k].text);
       el.onclick = () => jumpToUnit(+el.dataset.src, +el.dataset.unit);
     });
-    $("cv-edit").onclick = () => openEditor({ cardId: c.id, title: c.title, body: c.body });
+    $("cv-edit").onclick = () => { S.editingCard = true; renderCard(); };
     $("cv-del").onclick = async () => {
-      if (!confirm(`删除卡片「${c.title}」？它的关系也会一起删掉，原文句子不受影响。`)) return;
+      const n = kids.length;
+      if (!confirm(`删除卡片「${c.title}」？${n ? `它下面的 ${n} 张卡会升到最顶层。` : ""}它的关系也会一起删掉，原文句子不受影响。`)) return;
       await api("DELETE", "cards/" + c.id).catch(fail);
       S.cardId = null; loadCards(); refreshStats();
     };
-    renderLinks(c);
+    renderSide(c);
   }
-  function renderLinks(c) {
+
+  // In-place editor: Markdown on the left, live render on the right.
+  function renderCardEditor(c) {
+    const box = $("card-detail");
+    box.innerHTML = `<div class="card-view editing">
+        <input id="ce-title" class="ce-title" value="${esc(c.title)}" placeholder="标题">
+        <div class="editor"><textarea id="ce-body" placeholder="支持 Markdown、公式，[[另一张卡的标题]] 引用别的卡">${esc(c.body)}</textarea>
+          <div class="md preview" id="ce-preview"></div></div>
+        <div class="row gap"><button class="btn primary" id="ce-save">保存 <kbd>⌘↵</kbd></button>
+          <button class="btn" id="ce-cancel">取消 <kbd>Esc</kbd></button><span class="err" id="ce-err"></span></div>
+      </div>`;
+    const ta = $("ce-body");
+    let t;
+    const pv = () => { clearTimeout(t); t = setTimeout(() => mount($("ce-preview"), ta.value), 100); };
+    ta.addEventListener("input", pv); pv();
+    attachWikiComplete(ta, pv);
+    const save = async () => {
+      try {
+        await api("PATCH", "cards/" + c.id, { title: $("ce-title").value, body: ta.value });
+        S.editingCard = false; loadCards();
+      } catch (e) { $("ce-err").textContent = e.message; }
+    };
+    const cancel = () => { S.editingCard = false; renderCard(); };
+    $("ce-save").onclick = save; $("ce-cancel").onclick = cancel;
+    box.querySelector(".editing").addEventListener("keydown", e => {
+      if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); save(); }
+      if (e.key === "Escape" && !document.querySelector(".wl-pop")) { e.preventDefault(); cancel(); }
+    });
+    setTimeout(() => ta.focus(), 0);
+  }
+
+  function renderSide(c) {
     const side = $("card-links");
     const groups = [];
     for (const r of Object.keys(REL)) {
       const outs = c.out.filter(l => l.relation === r), ins = c.in.filter(l => l.relation === r);
-      if (outs.length) groups.push({ label: "这张卡 " + REL[r].out, items: outs, r, dir: "out" });
-      if (ins.length) groups.push({ label: REL[r].in, items: ins, r, dir: "in" });
+      if (outs.length) groups.push({ label: r === "belongs_to" ? "上一级" : "这张卡 " + REL[r].out, items: outs, r, dir: "out" });
+      if (ins.length) groups.push({ label: r === "belongs_to" ? "下一级" : REL[r].in, items: ins, r, dir: "in" });
     }
-    side.innerHTML = `<h3>关系</h3>
-      ${groups.length ? groups.map(g => `<div class="rel-group"><h4 style="color:${REL_COLOR[g.r]}">${g.label}</h4>
+    if (c.mentions_out.length) groups.push({ label: "正文里提到", items: c.mentions_out.map(m => ({ ...m, relation: "mentions" })), r: "mentions", dir: "body" });
+    side.innerHTML = `<h3>核对 <span class="hint">LLM 说的，查过了吗</span></h3>
+      <div class="checks">${Object.entries(CHECK).map(([k, v]) => `<button class="ck ${k} ${c.check === k ? "on" : ""}" data-ck="${k}">${v}</button>`).join("")}</div>
+      <textarea id="ck-note" class="ck-note" placeholder="依据：对照了哪段代码、哪篇文章、跑了什么实验">${esc(c.check_note)}</textarea>
+      <h3 style="margin-top:16px">关系</h3>
+      ${groups.length ? groups.map(g => `<div class="rel-group"><h4 style="color:${REL_COLOR[g.r] || "var(--muted)"}">${g.label}</h4>
         ${g.items.map(l => `<div class="link"><span class="t" data-go="${l.id}">${esc(l.title)}</span>
-          <button data-un="${g.dir === "out" ? c.id : l.id}|${g.r}|${g.dir === "out" ? l.id : c.id}" title="断开">断开</button></div>`).join("")}</div>`).join("")
-        : `<div class="hint" style="margin-bottom:12px">还没有关系。一张孤零零的卡很快会忘，把它挂到你已有的知识上。</div>`}
+          ${g.dir === "body" ? `<span class="hint">在正文里改</span>` : `<select class="rel-change" data-from="${g.dir === "out" ? c.id : l.id}" data-to="${g.dir === "out" ? l.id : c.id}" data-rel="${g.r}" title="改关系">
+            ${Object.entries(REL).map(([k, v]) => `<option value="${k}" ${k === g.r ? "selected" : ""}>${k === "belongs_to" ? "属于（上一级）" : v.out}</option>`).join("")}</select>
+          <button data-un="${g.dir === "out" ? c.id : l.id}|${g.r}|${g.dir === "out" ? l.id : c.id}" title="断开">断开</button>`}</div>`).join("")}</div>`).join("")
+        : `<div class="hint" style="margin-bottom:12px">还没有关系。孤零零的一张卡很快会忘，把它挂到你已有的知识上。</div>`}
       <div class="add-link">
         <div class="sentence">这张卡</div>
-        <select id="link-rel">${Object.entries(REL).map(([k, v]) => `<option value="${k}" ${k === S.relation ? "selected" : ""}>${v.out}</option>`).join("")}</select>
+        <select id="link-rel">${Object.entries(REL).map(([k, v]) => `<option value="${k}" ${k === S.relation ? "selected" : ""}>${k === "belongs_to" ? "属于（挂到它下面）" : v.out}</option>`).join("")}</select>
         <input id="link-q" placeholder="搜另一张卡，回车选第一个">
         <div id="link-cands"></div>
       </div>`;
-    side.querySelectorAll("[data-go]").forEach(el => el.onclick = () => { S.cardId = +el.dataset.go; remember(); renderCardList(); renderCard(); });
+    side.querySelectorAll("[data-ck]").forEach(b => b.onclick = async () => {
+      await api("POST", `cards/${c.id}/check`, { check: b.dataset.ck, note: $("ck-note").value }).catch(fail);
+      loadCards();
+    });
+    $("ck-note").onchange = () => api("POST", `cards/${c.id}/check`, { check: c.check, note: $("ck-note").value }).then(() => toast("依据存好了")).catch(fail);
+    side.querySelectorAll("[data-go]").forEach(el => el.onclick = () => openCard(+el.dataset.go));
     side.querySelectorAll("[data-un]").forEach(b => b.onclick = async () => {
       const [from, relation, to] = b.dataset.un.split("|");
       await api("DELETE", "links", { from: +from, relation, to: +to }).catch(fail);
-      renderCard(); renderCardList();
+      loadCards();
+    });
+    side.querySelectorAll(".rel-change").forEach(sel => sel.onchange = async () => {
+      await api("PATCH", "links", { from: +sel.dataset.from, relation: sel.dataset.rel, to: +sel.dataset.to, new_relation: sel.value }).catch(fail);
+      loadCards();
     });
     $("link-rel").onchange = () => { S.relation = $("link-rel").value; remember(); };
     const cands = async () => {
@@ -349,15 +498,13 @@
     };
     let t;
     $("link-q").oninput = () => { clearTimeout(t); t = setTimeout(cands, 120); };
-    $("link-q").onkeydown = e => {
-      if (e.key === "Enter") { const first = $("link-cands").querySelector(".cand"); if (first) addLink(c.id, +first.dataset.id); }
-    };
+    $("link-q").onkeydown = e => { if (e.key === "Enter") { const first = $("link-cands").querySelector(".cand"); if (first) addLink(c.id, +first.dataset.id); } };
     cands();
   }
   async function addLink(from, to) {
     try {
       await api("POST", "links", { from, relation: $("link-rel").value, to });
-      await renderCard(); renderCardList();
+      await loadCards();
       toast("连上了");
     } catch (e) { fail(e); }
   }
@@ -369,73 +516,142 @@
     if (i >= 0) select(i);
   }
 
-  // --------------------------------------------------------- ③ graph
-  let sim = null;
-  async function drawGraph() {
-    const g = await api("GET", "graph");
-    const svg = $("graph");
-    const W = svg.clientWidth || 800, H = svg.clientHeight || 600;
-    $("graph-legend").innerHTML = Object.entries(REL).map(([k, v]) => `<span><i style="background:${REL_COLOR[k]}"></i>${v.out}</span>`).join("")
-      + `<span>· 拖动节点，滚轮缩放，点节点打开卡片</span>`;
-    if (!g.nodes.length) { svg.innerHTML = `<text x="${W / 2}" y="${H / 2}" text-anchor="middle">还没有卡片</text>`; return; }
-    const prev = new Map((sim ? sim.nodes : []).map(n => [n.id, n]));
-    const nodes = g.nodes.map((n, k) => {
-      const p = prev.get(n.id);
-      const a = 2 * Math.PI * k / g.nodes.length;
-      return { ...n, x: p ? p.x : W / 2 + Math.cos(a) * 150, y: p ? p.y : H / 2 + Math.sin(a) * 150, vx: 0, vy: 0 };
+  // [[ typed in an editor pops up matching card titles.
+  function attachWikiComplete(ta, after) {
+    let pop = null, items = [], sel = 0;
+    const close = () => { pop?.remove(); pop = null; };
+    const pick = title => {
+      const pos = ta.selectionStart, before = ta.value.slice(0, pos), start = before.lastIndexOf("[[");
+      ta.value = ta.value.slice(0, start) + "[[" + title + "]]" + ta.value.slice(pos);
+      const caret = start + title.length + 4;
+      ta.setSelectionRange(caret, caret); close(); ta.focus(); after && after();
+    };
+    ta.addEventListener("input", async () => {
+      const before = ta.value.slice(0, ta.selectionStart);
+      const m = before.match(/\[\[([^\[\]\n|]*)$/);
+      if (!m) return close();
+      const q = m[1];
+      items = (await api("GET", "cards?q=" + encodeURIComponent(q))).filter(x => !S.card || x.id !== S.card.id).slice(0, 8);
+      if (q && !items.some(x => x.title === q)) items.push({ title: q, create: true });
+      if (!items.length) return close();
+      sel = 0;
+      if (!pop) { pop = document.createElement("div"); pop.className = "wl-pop"; ta.parentElement.appendChild(pop); }
+      pop.innerHTML = items.map((x, k) => `<div class="wl ${k === sel ? "on" : ""}" data-k="${k}">${x.create ? `引用一张还没有的卡：<b>${esc(x.title)}</b>` : esc(x.title)}</div>`).join("");
+      pop.querySelectorAll(".wl").forEach(el => el.onmousedown = e => { e.preventDefault(); pick(items[+el.dataset.k].title); });
     });
-    const byId = new Map(nodes.map(n => [n.id, n]));
-    const edges = g.edges.filter(e => byId.has(e.from) && byId.has(e.to)).map(e => ({ ...e, s: byId.get(e.from), t: byId.get(e.to) }));
-    const deg = new Map(); edges.forEach(e => { deg.set(e.from, (deg.get(e.from) || 0) + 1); deg.set(e.to, (deg.get(e.to) || 0) + 1); });
-    let view = { x: 0, y: 0, k: 1 };
-    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
-    svg.innerHTML = `<defs>${Object.entries(REL_COLOR).map(([k, c]) => `<marker id="ar-${k}" viewBox="0 0 10 10" refX="17" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="${c}"/></marker>`).join("")}</defs>
-      <g id="vp">${edges.map((e, k) => `<line data-e="${k}" stroke="${REL_COLOR[e.relation]}" marker-end="url(#ar-${e.relation})"/>`).join("")}
-      ${nodes.map((n, k) => `<g data-n="${k}"><circle r="${6 + Math.min(8, (deg.get(n.id) || 0) * 1.5)}"/><text text-anchor="middle" dy="${22 + Math.min(8, (deg.get(n.id) || 0) * 1.5)}">${esc(n.title.length > 24 ? n.title.slice(0, 23) + "…" : n.title)}</text></g>`).join("")}</g>`;
-    const vp = svg.querySelector("#vp");
-    const lines = [...svg.querySelectorAll("line")], gs = [...svg.querySelectorAll("g[data-n]")];
-    let drag = null, alpha = 1;
-    function tick() {
-      if (alpha > 0.02 || drag) {
-        alpha *= 0.985;
-        for (let i = 0; i < nodes.length; i++) for (let j = i + 1; j < nodes.length; j++) {
-          const a = nodes[i], b = nodes[j];
-          let dx = b.x - a.x, dy = b.y - a.y, d2 = dx * dx + dy * dy || 1;
-          const f = 2200 / d2, d = Math.sqrt(d2);
-          dx /= d; dy /= d;
-          a.vx -= dx * f; a.vy -= dy * f; b.vx += dx * f; b.vy += dy * f;
-        }
-        for (const e of edges) {
-          const dx = e.t.x - e.s.x, dy = e.t.y - e.s.y, d = Math.hypot(dx, dy) || 1, f = (d - 160) * 0.02;
-          e.s.vx += dx / d * f; e.s.vy += dy / d * f; e.t.vx -= dx / d * f; e.t.vy -= dy / d * f;
-        }
-        for (const n of nodes) {
-          n.vx += (W / 2 - n.x) * 0.002; n.vy += (H / 2 - n.y) * 0.002;
-          if (n === drag) { n.vx = n.vy = 0; continue; }
-          n.x += Math.max(-30, Math.min(30, n.vx * alpha)); n.y += Math.max(-30, Math.min(30, n.vy * alpha));
-          n.vx *= 0.6; n.vy *= 0.6;
-        }
-      }
-      edges.forEach((e, k) => { const l = lines[k]; l.setAttribute("x1", e.s.x); l.setAttribute("y1", e.s.y); l.setAttribute("x2", e.t.x); l.setAttribute("y2", e.t.y); });
-      nodes.forEach((n, k) => gs[k].setAttribute("transform", `translate(${n.x},${n.y})`));
-      if (S.view === "graph") requestAnimationFrame(tick);
-    }
-    const pt = e => { const r = svg.getBoundingClientRect(); return { x: (e.clientX - r.left) * W / r.width / view.k - view.x, y: (e.clientY - r.top) * H / r.height / view.k - view.y }; };
-    let moved = false, pan = null;
-    gs.forEach((el, k) => el.onpointerdown = e => { e.stopPropagation(); drag = nodes[k]; moved = false; alpha = Math.max(alpha, 0.3); svg.setPointerCapture(e.pointerId); });
-    svg.onpointerdown = e => { pan = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y }; svg.setPointerCapture(e.pointerId); };
-    svg.onpointermove = e => {
-      if (drag) { const p = pt(e); drag.x = p.x; drag.y = p.y; moved = true; }
-      else if (pan) { const r = svg.getBoundingClientRect(); view.x = pan.vx + (e.clientX - pan.x) * W / r.width / view.k; view.y = pan.vy + (e.clientY - pan.y) * H / r.height / view.k; apply(); }
+    ta.addEventListener("keydown", e => {
+      if (!pop) return;
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        sel = (sel + (e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length;
+        pop.querySelectorAll(".wl").forEach((el, k) => el.classList.toggle("on", k === sel));
+      } else if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); pick(items[sel].title); }
+      else if (e.key === "Escape") { e.stopPropagation(); close(); }
+    });
+    ta.addEventListener("blur", () => setTimeout(close, 150));
+  }
+
+  // Clicking [[a link]] anywhere opens that card, or offers to create it.
+  document.addEventListener("click", async e => {
+    const a = e.target.closest("a.wikilink");
+    if (!a) return;
+    e.preventDefault();
+    const target = a.dataset.target;
+    let id = /^#\d+$/.test(target) ? +target.slice(1) : null;
+    if (!id) { const hit = (await api("GET", "cards?q=" + encodeURIComponent(target))).find(x => x.title === target); id = hit && hit.id; }
+    if (id) return openCard(id);
+    if (confirm(`还没有「${target}」这张卡，现在建？`)) openEditor({ title: target, body: "" });
+  });
+
+  // --------------------------------------------------------- ③ board
+  // You place the cards. Positions are saved; nothing is laid out for you.
+  const BW = 230;
+  let boardView = JSON.parse(localStorage.getItem("km-board") || '{"x":40,"y":40,"k":1}');
+  async function drawBoard() {
+    const data = await api("GET", "board");
+    const placed = data.cards.filter(c => c.x != null), loose = data.cards.filter(c => c.x == null);
+    $("tray").innerHTML = `<h3>还没摆的 <span class="hint">拖到右边白板上</span></h3>` + (loose.length
+      ? loose.map(c => `<div class="tray-card" draggable="true" data-id="${c.id}"><span class="dot ${c.check}"></span><span class="md" data-t="${c.id}"></span></div>`).join("")
+      : `<div class="hint">都摆上了</div>`);
+    loose.forEach(c => mount($("tray").querySelector(`[data-t="${c.id}"]`), c.title, { inline: true }));
+    $("tray").querySelectorAll(".tray-card").forEach(el => el.ondragstart = e => e.dataTransfer.setData("text/km-card", el.dataset.id));
+
+    const stage = $("stage"), layer = $("layer");
+    layer.innerHTML = `<svg id="edges"></svg>` + placed.map(c => `<div class="bcard ${c.check}" data-id="${c.id}" style="left:${c.x}px;top:${c.y}px;width:${BW}px">
+        <div class="bt md"></div><div class="bb md"></div>
+        <button class="bx" title="从白板拿下来">×</button></div>`).join("");
+    placed.forEach(c => {
+      const el = layer.querySelector(`.bcard[data-id="${c.id}"]`);
+      mount(el.querySelector(".bt"), c.title, { inline: true });
+      mount(el.querySelector(".bb"), c.body);
+    });
+    const apply = () => { layer.style.transform = `translate(${boardView.x}px,${boardView.y}px) scale(${boardView.k})`; localStorage.setItem("km-board", JSON.stringify(boardView)); };
+    apply();
+    const drawEdges = () => {
+      const svg = $("edges"), pos = new Map();
+      layer.querySelectorAll(".bcard").forEach(el => pos.set(+el.dataset.id, { x: el.offsetLeft + el.offsetWidth / 2, y: el.offsetTop + el.offsetHeight / 2, el }));
+      const ok = data.edges.filter(e => pos.has(e.from) && pos.has(e.to));
+      let W = 0, H = 0; pos.forEach(p => { W = Math.max(W, p.el.offsetLeft + p.el.offsetWidth + 40); H = Math.max(H, p.el.offsetTop + p.el.offsetHeight + 40); });
+      svg.setAttribute("width", W); svg.setAttribute("height", H);
+      svg.innerHTML = `<defs>${Object.entries({ ...REL_COLOR, mentions: "#9ca3af" }).map(([k, c]) => `<marker id="bar-${k}" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="${c}"/></marker>`).join("")}</defs>`
+        + ok.map(e => {
+          const a = pos.get(e.from), b = pos.get(e.to);
+          const end = edgePoint(b, a), start = edgePoint(a, b);
+          const color = e.relation === "mentions" ? "#9ca3af" : REL_COLOR[e.relation];
+          return `<line x1="${start.x}" y1="${start.y}" x2="${end.x}" y2="${end.y}" stroke="${color}" stroke-width="${e.relation === "belongs_to" ? 2.2 : 1.5}"
+            ${e.relation === "mentions" ? 'stroke-dasharray="5 4"' : ""} marker-end="url(#bar-${e.relation})"/>`;
+        }).join("");
     };
-    svg.onpointerup = () => {
-      if (drag && !moved) { S.cardId = drag.id; remember(); show("cards"); }
-      drag = null; pan = null;
+    // where the line from a box's centre toward `to` leaves the box
+    const edgePoint = (p, to) => {
+      const w = p.el.offsetWidth / 2 + 4, h = p.el.offsetHeight / 2 + 4, dx = to.x - p.x, dy = to.y - p.y;
+      const t = Math.min(w / Math.abs(dx || 1e-9), h / Math.abs(dy || 1e-9));
+      return { x: p.x + dx * t, y: p.y + dy * t };
     };
-    svg.onwheel = e => { e.preventDefault(); view.k = Math.max(0.3, Math.min(3, view.k * (e.deltaY < 0 ? 1.1 : 0.9))); apply(); };
-    const apply = () => vp.setAttribute("transform", `scale(${view.k}) translate(${view.x},${view.y})`);
-    sim = { nodes };
-    tick();
+    requestAnimationFrame(drawEdges);
+    setTimeout(drawEdges, 300); // after KaTeX/mermaid settle
+
+    const toBoard = (cx, cy) => { const r = stage.getBoundingClientRect(); return { x: (cx - r.left - boardView.x) / boardView.k, y: (cy - r.top - boardView.y) / boardView.k }; };
+    layer.querySelectorAll(".bcard").forEach(el => {
+      const id = +el.dataset.id;
+      el.querySelector(".bx").onclick = async e => { e.stopPropagation(); await api("POST", `cards/${id}/place`, { x: null, y: null }).catch(fail); drawBoard(); };
+      el.ondblclick = () => openCard(id);
+      el.onpointerdown = e => {
+        if (e.target.closest(".bx, a")) return;
+        e.stopPropagation(); el.setPointerCapture(e.pointerId);
+        const start = toBoard(e.clientX, e.clientY), ox = el.offsetLeft, oy = el.offsetTop;
+        el.classList.add("dragging");
+        el.onpointermove = ev => { const p = toBoard(ev.clientX, ev.clientY); el.style.left = (ox + p.x - start.x) + "px"; el.style.top = (oy + p.y - start.y) + "px"; drawEdges(); };
+        el.onpointerup = async () => {
+          el.onpointermove = el.onpointerup = null; el.classList.remove("dragging");
+          if (el.offsetLeft !== ox || el.offsetTop !== oy) await api("POST", `cards/${id}/place`, { x: el.offsetLeft, y: el.offsetTop }).catch(fail);
+        };
+      };
+    });
+    stage.onpointerdown = e => {
+      if (e.target.closest(".bcard")) return;
+      const sx = e.clientX, sy = e.clientY, vx = boardView.x, vy = boardView.y;
+      stage.setPointerCapture(e.pointerId); stage.classList.add("panning");
+      stage.onpointermove = ev => { boardView.x = vx + ev.clientX - sx; boardView.y = vy + ev.clientY - sy; apply(); };
+      stage.onpointerup = () => { stage.onpointermove = stage.onpointerup = null; stage.classList.remove("panning"); };
+    };
+    stage.onwheel = e => {
+      e.preventDefault();
+      const r = stage.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+      const k = Math.max(0.3, Math.min(2.5, boardView.k * (e.deltaY < 0 ? 1.1 : 1 / 1.1)));
+      boardView.x = mx - (mx - boardView.x) * k / boardView.k; boardView.y = my - (my - boardView.y) * k / boardView.k; boardView.k = k; apply();
+    };
+    stage.ondragover = e => e.preventDefault();
+    stage.ondrop = async e => {
+      e.preventDefault();
+      const id = +e.dataTransfer.getData("text/km-card");
+      if (!id) return;
+      const p = toBoard(e.clientX, e.clientY);
+      await api("POST", `cards/${id}/place`, { x: Math.round(p.x - BW / 2), y: Math.round(p.y - 20) }).catch(fail);
+      drawBoard();
+    };
+    $("board-legend").innerHTML = Object.entries(REL).map(([k, v]) => `<span><i style="background:${REL_COLOR[k]}"></i>${k === "belongs_to" ? "属于（上一级）" : v.out}</span>`).join("")
+      + `<span><i style="background:#9ca3af"></i>正文里提到</span><span>· 拖卡片摆位置，拖空白处平移，滚轮缩放，双击打开</span>`;
   }
 
   // --------------------------------------------------------- import
@@ -496,6 +712,7 @@
   document.addEventListener("keydown", e => {
     if (e.key === "Escape") { document.querySelectorAll(".modal.on").forEach(m => m.classList.remove("on")); }
     if (document.querySelector(".modal.on") || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (S.view === "cards" && e.key.toLowerCase() === "e" && S.cardId && !S.editingCard) { e.preventDefault(); S.editingCard = true; return renderCard(); }
     if (S.view !== "sift" || !S.units.length) return;
     const k = e.key.toLowerCase();
     const u = S.units[S.cur];
@@ -515,5 +732,5 @@
 
   // --------------------------------------------------------- start
   refreshStats().catch(fail);
-  loadSources().then(() => show(S.view || "sift")).catch(fail);
+  loadSources().then(() => show(["sift", "cards", "board"].includes(S.view) ? S.view : "sift")).catch(fail);
 })();

@@ -25,9 +25,9 @@
     return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
   }
 
-  // Returns [textWithTokens, formulas].
+  // Returns [textWithTokens, formulas, wikilinks].
   function extractMath(src) {
-    const out = [], math = [];
+    const out = [], math = [], links = [];
     let i = 0;
     const n = src.length;
     const token = (tex, display) => {
@@ -57,6 +57,19 @@
         const ticks = src.slice(i).match(/^`+/)[0];
         const close = src.indexOf(ticks, i + ticks.length);
         if (close > 0) { out.push(src.slice(i, close + ticks.length)); i = close + ticks.length; continue; }
+      }
+      // [[card title]] / [[card title|shown text]] → link to another card
+      if (src.startsWith("[[", i)) {
+        const close = src.indexOf("]]", i + 2), nl = src.indexOf("\n", i);
+        if (close > 0 && (nl < 0 || close < nl)) {
+          const [target, label] = src.slice(i + 2, close).split("|");
+          if (target.trim()) {
+            links.push({ target: target.trim(), label: (label || target).trim() });
+            out.push(`KMLINK${links.length - 1}KM`);
+            i = close + 2;
+            continue;
+          }
+        }
       }
       // escaped dollar
       if (src[i] === "\\" && src[i + 1] === "$") { out.push("\\$"); i += 2; continue; }
@@ -92,7 +105,7 @@
       out.push(src[i]);
       i++;
     }
-    return [out.join(""), math];
+    return [out.join(""), math, links];
   }
 
   function renderTex(tex, display) {
@@ -103,15 +116,22 @@
     }
   }
 
-  function renderMarkdown(src, { inline = false } = {}) {
+  // refs: {target: cardId|null} from the server; missing targets show as such.
+  function renderMarkdown(src, { inline = false, refs = null } = {}) {
     if (!window.markdownit) return `<pre>${escapeHtml(src)}</pre>`;
-    const [text, math] = extractMath(String(src || ""));
+    const [text, math, links] = extractMath(String(src || ""));
     let html = inline && !/\n\s*\n/.test(text) && !/^\s*([#>|-]|\d+\.|```)/m.test(text)
       ? md.renderInline(text) : md.render(text);
     html = window.DOMPurify ? DOMPurify.sanitize(html, { ADD_ATTR: ["target"] }) : html;
     return html
       .replace(/<p>\s*KMMATH(\d+)KM\s*<\/p>/g, (_, k) => `<div class="math-block">${renderTex(math[+k].tex, true)}</div>`)
-      .replace(/KMMATH(\d+)KM/g, (_, k) => renderTex(math[+k].tex, math[+k].display));
+      .replace(/KMMATH(\d+)KM/g, (_, k) => renderTex(math[+k].tex, math[+k].display))
+      .replace(/KMLINK(\d+)KM/g, (_, k) => {
+        const l = links[+k];
+        const missing = refs && !refs[l.target];
+        return `<a href="#" class="wikilink${missing ? " missing" : ""}" data-target="${escapeHtml(l.target)}"`
+          + `${missing ? ' title="还没有这张卡，点一下新建"' : ""}>${escapeHtml(l.label)}</a>`;
+      });
   }
 
   let mermaidLoading = null;
@@ -138,7 +158,7 @@
   // Render into an element and finish async parts (mermaid).
   function mount(el, src, opts) {
     el.innerHTML = renderMarkdown(src, opts);
-    el.querySelectorAll("a[href]").forEach(a => { a.target = "_blank"; a.rel = "noopener"; });
+    el.querySelectorAll("a[href]:not(.wikilink)").forEach(a => { a.target = "_blank"; a.rel = "noopener"; });
     renderMermaidIn(el);
   }
 

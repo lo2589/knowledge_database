@@ -15,7 +15,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from .importers import ImportErrorKM, list_claude_sessions, load_bytes, load_text
-from .store import RELATIONS, KnowledgeStore
+from .store import CHECKS, RELATIONS, KnowledgeStore
 
 WEB = Path(__file__).parent / "web"
 MAX_BODY = 64 * 1024 * 1024
@@ -32,7 +32,7 @@ class Api:
         num = lambda i: int(parts[i])
 
         if parts == ["meta"]:
-            return {"relations": RELATIONS, "stats": s.stats()}
+            return {"relations": RELATIONS, "checks": CHECKS, "stats": s.stats()}
         if parts == ["sources"] and method == "GET":
             return s.sources()
         if parts == ["sources"] and method == "POST":
@@ -40,6 +40,8 @@ class Api:
         if len(parts) == 2 and parts[0] == "sources" and method == "DELETE":
             s.delete_source(num(1))
             return {"ok": True}
+        if len(parts) == 2 and parts[0] == "sources" and method == "PATCH":
+            return s.rename_source(num(1), body.get("title", ""))
         if len(parts) == 3 and parts[0] == "sources" and parts[2] == "units":
             return s.units(num(1))
         if parts == ["claude-sessions"]:
@@ -52,6 +54,20 @@ class Api:
             return s.cards(query.get("q", [""])[0])
         if parts == ["cards"] and method == "POST":
             return s.create_card(body.get("title", ""), body.get("body", ""), [int(x) for x in body.get("units", [])])
+        if parts == ["tree"]:
+            return s.tree()
+        if parts == ["board"]:
+            return s.board()
+        if len(parts) == 3 and parts[0] == "cards" and method == "POST":
+            cid, action = num(1), parts[2]
+            if action == "move":
+                parent, before = body.get("parent"), body.get("before")
+                return s.move_card(cid, None if parent is None else int(parent), None if before is None else int(before))
+            if action == "place":
+                x, y = body.get("x"), body.get("y")
+                return s.place_card(cid, None if x is None else float(x), None if y is None else float(y))
+            if action == "check":
+                return s.check_card(cid, body.get("check", ""), body.get("note", ""))
         if len(parts) == 2 and parts[0] == "cards":
             if method == "GET":
                 return s.card(num(1))
@@ -62,6 +78,8 @@ class Api:
                 return {"ok": True}
         if parts == ["links"] and method == "POST":
             return s.link_cards(int(body["from"]), body["relation"], int(body["to"]))
+        if parts == ["links"] and method == "PATCH":
+            return s.relink_cards(int(body["from"]), body["relation"], int(body["to"]), body["new_relation"])
         if parts == ["links"] and method == "DELETE":
             return s.unlink_cards(int(body["from"]), body["relation"], int(body["to"]))
         if parts == ["graph"]:

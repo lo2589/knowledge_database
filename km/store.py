@@ -23,7 +23,7 @@ from .importers import Document
 from .split import split_markdown
 
 RELATIONS = {
-    "belongs_to": "属于",      # A 属于 B：B 是 A 的上级主题
+    "belongs_to": "属于",      # A 属于 B：B 是 A 的上一级。每张卡最多一个上级，组成层级树
     "prerequisite": "前提是",  # A 的前提是 B：先懂 B 才能懂 A
     "example_of": "是例子",    # A 是 B 的例子
     "refines": "细化了",       # A 细化了 B
@@ -31,6 +31,28 @@ RELATIONS = {
     "related": "相关",
 }
 STATUSES = ("new", "kept", "dropped")
+PARENT = "belongs_to"
+# Did what the LLM said hold up? Set by you after checking against a source.
+# "fixed": the LLM got it wrong and the card now says what the source says.
+CHECKS = {"unchecked": "未核对", "ok": "对", "fixed": "改正过", "doubt": "存疑", "wrong": "错"}
+
+# [[标题]] / [[标题|显示的字]] / [[#12]] inside a card body. Each one becomes a
+# "mentions" link, kept in sync with the body on every save; it is separate
+# from RELATIONS because the body, not the links panel, owns it.
+MENTIONS = "mentions"
+WIKILINK = re.compile(r"\[\[([^\[\]\n|]+?)(?:\|([^\[\]\n]+))?\]\]")
+_CODE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
+
+
+def wiki_targets(body: str) -> list[str]:
+    """Targets of [[...]] in order, ignoring ones inside code."""
+    seen, out = set(), []
+    for m in WIKILINK.finditer(_CODE.sub(" ", body)):
+        t = m.group(1).strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 def now_ms() -> int:
@@ -174,6 +196,8 @@ class KnowledgeStore:
             for uid in unit_ids:
                 self.db.link(cid, "from_unit", uid)
                 self.db.patch(uid, {"attrs": {"status": "kept"}})
+            self._sync_mentions(cid, body)
+            self._resolve_dangling(title)
             return self._card(cid)
 
     def update_card(self, cid: int, *, title: str | None = None, body: str | None = None) -> dict:
@@ -188,7 +212,13 @@ class KnowledgeStore:
                 if not body.strip():
                     raise ValueError("卡片内容不能为空")
                 attrs["body"] = body
+            old_title = self.db.get(cid, links="none")["attrs"]["title"]
             self.db.patch(cid, patch)
+            if title is not None and attrs["title"] != old_title:
+                self._rename_references(cid, old_title, attrs["title"])
+                self._resolve_dangling(attrs["title"])
+            if body is not None:
+                self._sync_mentions(cid, body)
             return self._card(cid)
 
     def delete_card(self, cid: int) -> None:
@@ -226,13 +256,124 @@ class KnowledgeStore:
         with self.lock:
             self._need(a, "card")
             self._need(b, "card")
-            self.db.link(a, relation, b)
+            if relation == PARENT:
+                self._set_parent(a, b)
+            else:
+                self.db.link(a, relation, b)
             return self._card(a)
 
     def unlink_cards(self, a: int, relation: str, b: int) -> dict:
         with self.lock:
             self.db.unlink(a, relation, b)
             return self._card(a)
+
+    # --- hierarchy, placement, checking -------------------------------------
+
+    def move_card(self, cid: int, parent: int | None, before: int | None = None) -> list[dict]:
+        """Put a card under `parent` (None = top level), just before sibling `before`
+        (None = last). This is the drag-and-drop in the tree."""
+        with self.lock:
+            self._need(cid, "card")
+            if parent is not None:
+                self._need(parent, "card")
+            self._set_parent(cid, parent)
+            siblings = [c for c in self._children(parent) if c["id"] != cid]
+            ids = [c["id"] for c in siblings]
+            ids.insert(ids.index(before) if before in ids else len(ids), cid)
+            for k, sid in enumerate(ids):
+                self.db.patch(sid, {"attrs": {"pos": k}})
+            return self._tree()
+
+    def tree(self) -> list[dict]:
+        with self.lock:
+            return self._tree()
+
+    def place_card(self, cid: int, x: float | None, y: float | None) -> dict:
+        """Where the card sits on the board; None, None takes it off the board."""
+        with self.lock:
+            self._need(cid, "card")
+            self.db.patch(cid, {"attrs": {"x": x, "y": y}})
+            return self._get(cid)
+
+    def check_card(self, cid: int, check: str, note: str = "") -> dict:
+        if check not in CHECKS:
+            raise ValueError(f"核对状态只能是 {list(CHECKS)}")
+        with self.lock:
+            self._need(cid, "card")
+            self.db.patch(cid, {"attrs": {"check": check, "check_note": note}})
+            return self._card(cid)
+
+    def board(self) -> dict:
+        with self.lock:
+            res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "card"},
+                                 "include_data": True, "limit": 100000})
+            cards, edges = [], []
+            for n in res["nodes"]:
+                a = n["attrs"]
+                cards.append({"id": n["id"], "title": a["title"], "body": a["body"],
+                              "x": a.get("x"), "y": a.get("y"), "check": a.get("check", "unchecked")})
+                for l in self._links(n["id"])["out"]:
+                    if l["relation"] in RELATIONS or l["relation"] == MENTIONS:
+                        edges.append({"from": n["id"], "to": l["id"], "relation": l["relation"]})
+            return {"cards": cards, "edges": edges}
+
+    def _parent_of(self, cid: int) -> int | None:
+        ups = [l["id"] for l in self._links(cid)["out"] if l["relation"] == PARENT]
+        return ups[0] if ups else None
+
+    def _set_parent(self, cid: int, parent: int | None) -> None:
+        if parent == cid:
+            raise ValueError("卡片不能挂在自己下面")
+        up = parent
+        while up is not None:  # refuse cycles: the new parent must not sit under this card
+            if up == cid:
+                raise ValueError("不能挂到它自己的下级下面，会转圈")
+            up = self._parent_of(up)
+        for l in self._links(cid)["out"]:
+            if l["relation"] == PARENT:
+                self.db.unlink(cid, PARENT, l["id"])
+        if parent is not None:
+            self.db.link(cid, PARENT, parent)
+
+    def _children(self, parent: int | None) -> list[dict]:
+        if parent is None:
+            res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "card"},
+                                 "include_data": True, "limit": 100000})
+            nodes = [n for n in res["nodes"] if self._parent_of(n["id"]) is None]
+        else:
+            ids = [l["id"] for l in self._links(parent)["in"] if l["relation"] == PARENT]
+            nodes = [self.db.get(i, links="none") for i in ids]
+        nodes.sort(key=lambda n: (n["attrs"].get("pos", 1e9), n["attrs"]["created"]))
+        return [{"id": n["id"], **n["attrs"]} for n in nodes]
+
+    def _tree(self) -> list[dict]:
+        def build(parent):
+            return [{"id": c["id"], "title": c["title"], "check": c.get("check", "unchecked"),
+                     "children": build(c["id"])} for c in self._children(parent)]
+        return build(None)
+
+    def relink_cards(self, a: int, relation: str, b: int, new_relation: str) -> dict:
+        """Change what kind of relation an existing link is."""
+        if new_relation not in RELATIONS:
+            raise ValueError(f"关系只能是 {list(RELATIONS)}")
+        with self.lock:
+            if not any(l["relation"] == relation and l["id"] == b for l in self._links(a)["out"]):
+                raise KeyError("这条关系不存在")
+            self.db.unlink(a, relation, b)
+            if new_relation == PARENT:
+                self._set_parent(a, b)
+            else:
+                self.db.link(a, new_relation, b)
+            return self._card(a)
+
+    def rename_source(self, sid: int, title: str) -> dict:
+        title = title.strip()
+        if not title:
+            raise ValueError("标题不能为空")
+        with self.lock:
+            self._need(sid, "source")
+            self.db.patch(sid, {"summary": plain(title, 120), "attrs": {"title": title}})
+            return self._get(sid)
 
     def graph(self) -> dict:
         with self.lock:
@@ -242,7 +383,7 @@ class KnowledgeStore:
             edges = []
             for n in res["nodes"]:
                 for l in self._links(n["id"])["out"]:
-                    if l["relation"] in RELATIONS:
+                    if l["relation"] in RELATIONS or l["relation"] == MENTIONS:
                         edges.append({"from": n["id"], "to": l["id"], "relation": l["relation"]})
             return {"nodes": nodes, "edges": edges}
 
@@ -274,6 +415,9 @@ class KnowledgeStore:
                      for l in n["links"]["out"] if l["relation"] in RELATIONS]
         in_links = [{"relation": l["relation"], "id": l["id"], "title": l["summary"]}
                     for l in n["links"]["in"] if l["relation"] in RELATIONS]
+        mentions_out = [{"id": l["id"], "title": l["summary"]} for l in n["links"]["out"] if l["relation"] == MENTIONS]
+        mentions_in = [{"id": l["id"], "title": l["summary"]} for l in n["links"]["in"] if l["relation"] == MENTIONS]
+        refs = {t: self._resolve(t) for t in wiki_targets(a["body"])}
         origins = []
         for l in n["links"]["out"]:
             if l["relation"] == "from_unit":
@@ -284,7 +428,47 @@ class KnowledgeStore:
                 origins.append({"unit": u["id"], "text": u["attrs"]["text"], "source": u["attrs"]["source"],
                                 "source_title": src["attrs"]["title"] if src else "（资料已删除）"})
         return {"id": cid, "title": a["title"], "body": a["body"], "created": a["created"],
-                "updated": a["updated"], "out": out_links, "in": in_links, "origins": origins}
+                "updated": a["updated"], "out": out_links, "in": in_links, "origins": origins,
+                "mentions_out": mentions_out, "mentions_in": mentions_in, "refs": refs,
+                "check": a.get("check", "unchecked"), "check_note": a.get("check_note", ""),
+                "x": a.get("x"), "y": a.get("y")}
+
+    def _resolve(self, target: str) -> int | None:
+        """[[target]] → card id: "#12" by id, otherwise by exact title."""
+        if re.fullmatch(r"#\d+", target):
+            n = self.db.get(int(target[1:]), links="none")
+            return n["id"] if n and n["type"] == "card" else None
+        ids = self.db.query({"predicate": {"op": "and", "args": [
+            {"op": "eq", "field": "@type", "value": "card"},
+            {"op": "eq", "field": "/title", "value": target}]}, "limit": 1})["ids"]
+        return ids[0] if ids else None
+
+    def _sync_mentions(self, cid: int, body: str) -> None:
+        want = {t for t in (self._resolve(x) for x in wiki_targets(body)) if t and t != cid}
+        have = {l["id"] for l in self._links(cid)["out"] if l["relation"] == MENTIONS}
+        for t in have - want:
+            self.db.unlink(cid, MENTIONS, t)
+        for t in want - have:
+            self.db.link(cid, MENTIONS, t)
+
+    def _rename_references(self, cid: int, old: str, new: str) -> None:
+        """Rewrite [[old]] in every card that mentions this one, so renames never break links."""
+        pattern = re.compile(r"\[\[" + re.escape(old) + r"(\|[^\[\]\n]+)?\]\]")
+        for l in self._links(cid)["in"]:
+            if l["relation"] != MENTIONS:
+                continue
+            other = self.db.get(l["id"], links="none")
+            body = pattern.sub(lambda m: "[[" + new + (m.group(1) or "") + "]]", other["attrs"]["body"])
+            if body != other["attrs"]["body"]:
+                self.db.patch(other["id"], {"attrs": {"body": body}})
+
+    def _resolve_dangling(self, title: str) -> None:
+        """A new (or renamed) card may be what some [[title]] elsewhere was waiting for."""
+        res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "card"},
+                             "include_data": True, "limit": 100000})
+        for n in res["nodes"]:
+            if "[[" + title in n["attrs"]["body"]:
+                self._sync_mentions(n["id"], n["attrs"]["body"])
 
 
 def _cjk_end(text: str) -> bool:

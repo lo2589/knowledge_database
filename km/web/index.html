@@ -15,7 +15,7 @@
   <nav id="tabs">
     <button data-view="sift" class="on">① 拆分与筛选</button>
     <button data-view="cards">② 卡片与链接</button>
-    <button data-view="graph">③ 关系图</button>
+    <button data-view="board">③ 摆放</button>
   </nav>
   <span class="stats" id="stats"></span>
   <span class="grow"></span>
@@ -51,16 +51,17 @@
   <!-- ② cards & links -->
   <section class="view" id="v-cards">
     <aside class="side">
-      <input class="search" id="card-q" placeholder="搜卡片…">
+      <input class="search" id="card-q" placeholder="搜卡片…（清空回到层级）">
       <div id="card-list"></div>
     </aside>
     <div class="center" id="card-detail"></div>
     <aside class="side right" id="card-links"></aside>
   </section>
 
-  <!-- ③ graph -->
-  <section class="view" id="v-graph">
-    <div class="center full"><svg id="graph"></svg><div class="graph-legend" id="graph-legend"></div></div>
+  <!-- ③ board: you place the cards -->
+  <section class="view" id="v-board">
+    <aside class="side" id="tray"></aside>
+    <div class="stage" id="stage"><div class="layer" id="layer"></div><div class="graph-legend" id="board-legend"></div></div>
   </section>
 </main>
 

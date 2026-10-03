@@ -150,6 +150,62 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.s.stats(), {"sources": 0, "units": 0, "cards": 1})
 
 
+class StructureTests(unittest.TestCase):
+    """Hierarchy, in-body links, checking and board placement."""
+
+    def setUp(self):
+        self.s = KnowledgeStore(":memory:")
+        self.root = self.s.create_card("Transformer", "总览", [])["id"]
+        self.attn = self.s.create_card("注意力", "$\\mathrm{softmax}(QK^T/\\sqrt{d_k})V$", [])["id"]
+        self.mask = self.s.create_card("因果遮罩", "下三角", [])["id"]
+
+    def titles(self, nodes):
+        return [(n["title"], self.titles(n["children"])) for n in nodes]
+
+    def test_move_builds_ordered_tree(self):
+        self.s.move_card(self.attn, self.root)
+        tree = self.s.move_card(self.mask, self.root, before=self.attn)
+        self.assertEqual(self.titles(tree), [("Transformer", [("因果遮罩", []), ("注意力", [])])])
+
+    def test_one_parent_only_and_no_cycles(self):
+        self.s.move_card(self.attn, self.root)
+        self.s.link_cards(self.attn, "belongs_to", self.mask)  # re-filing replaces the parent
+        self.assertEqual([l["id"] for l in self.s.card(self.attn)["out"] if l["relation"] == "belongs_to"], [self.mask])
+        with self.assertRaises(ValueError):
+            self.s.move_card(self.mask, self.attn)  # attn is under mask
+
+    def test_deleting_parent_lifts_children_to_top(self):
+        self.s.move_card(self.attn, self.root)
+        self.s.delete_card(self.root)
+        self.assertEqual(sorted(t for t, _ in self.titles(self.s.tree())), ["因果遮罩", "注意力"])
+
+    def test_wikilinks_follow_body_and_renames(self):
+        self.s.update_card(self.root, body="见 [[注意力]] 和 [[位置编码|位置]]，代码里的 `[[不算]]`")
+        card = self.s.card(self.root)
+        self.assertEqual(card["refs"], {"注意力": self.attn, "位置编码": None})
+        pos = self.s.create_card("位置编码", "wpe", [])["id"]
+        self.assertEqual(self.s.card(self.root)["refs"]["位置编码"], pos)
+        self.s.update_card(self.attn, title="自注意力")
+        self.assertIn("[[自注意力]]", self.s.card(self.root)["body"])
+        self.s.update_card(self.root, body="不再提了")
+        self.assertEqual(self.s.card(self.root)["mentions_out"], [])
+
+    def test_check_and_place(self):
+        c = self.s.check_card(self.attn, "doubt", "模型说除以 d_k，源码是 sqrt")
+        self.assertEqual((c["check"], c["check_note"]), ("doubt", "模型说除以 d_k，源码是 sqrt"))
+        with self.assertRaises(ValueError):
+            self.s.check_card(self.attn, "maybe")
+        self.s.place_card(self.attn, 120, 40)
+        self.assertEqual({c["id"]: (c["x"], c["y"]) for c in self.s.board()["cards"]}[self.attn], (120, 40))
+        self.s.place_card(self.attn, None, None)
+        self.assertEqual({c["id"]: c["x"] for c in self.s.board()["cards"]}[self.attn], None)
+
+    def test_relink_changes_kind(self):
+        self.s.link_cards(self.mask, "related", self.attn)
+        self.s.relink_cards(self.mask, "related", self.attn, "prerequisite")
+        self.assertEqual([l["relation"] for l in self.s.card(self.mask)["out"]], ["prerequisite"])
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         from http.server import ThreadingHTTPServer
