@@ -106,6 +106,8 @@
       toast(d.note || "已入库");
     }
     if (d.type === "cwd" && d.cwd) $("imp-folder").value = d.cwd;
+    // The sidebar was widened or narrowed: switch between the full and narrow layouts.
+    if (d.type === "layout") { document.body.classList.toggle("side", !d.wide); if (S.view === "map") drawMap(); }
   });
   $("kept-head").onclick = () => document.body.classList.contains("side") && $("kept-panel").classList.toggle("open");
 

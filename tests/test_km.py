@@ -27,6 +27,10 @@ class SplitTests(unittest.TestCase):
     def test_dollar_amounts_are_not_math(self):
         self.assertEqual(split_sentences("价格是 $5 和 $10。第二句。"), ["价格是 $5 和 $10。", "第二句。"])
 
+    def test_shell_variables_are_not_math(self):
+        s = 'echo "$HOME/.local/bin:$PATH" 写进去。下一句。'
+        self.assertEqual(split_sentences(s), ['echo "$HOME/.local/bin:$PATH" 写进去。', "下一句。"])
+
     def test_english_abbreviations_urls_decimals(self):
         s = "See e.g. https://arxiv.org/abs/1234.5678. Pi is 3.14 here. Done."
         self.assertEqual(split_sentences(s), ["See e.g. https://arxiv.org/abs/1234.5678.", "Pi is 3.14 here.", "Done."])

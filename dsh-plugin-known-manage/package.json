@@ -1,0 +1,22 @@
+{
+  "name": "dsh-plugin-known-manage",
+  "version": "0.1.0",
+  "private": true,
+  "description": "known_manage inside dsh: a knowledge-base sidebar, 「入库」 under every answer, whole-session ingest. Splits, sifts, cards, strict hierarchy, FastNode storage.",
+  "type": "commonjs",
+  "main": "src/host.js",
+  "exports": {
+    ".": "./src/host.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json"
+  },
+  "files": ["src", "cordis.patch.yml"],
+  "dsh": {
+    "bundle": {
+      "patch": "cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}

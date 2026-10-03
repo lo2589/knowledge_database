@@ -186,7 +186,7 @@ def _is_cjk(ch: str) -> bool:
 # not math), then math, then links and other dotted things.
 PROTECT = [
     re.compile(r"(`+)(?:(?!\1).)+?\1"),                        # inline code
-    re.compile(r"(?<![\\$])\$(?!\s)(?:\\.|[^$\n\\])+?(?<!\s)\$(?!\d)"),  # $math$
+    re.compile(r"(?<![\\$])\$(?!\s)(?:\\.|[^$\n\\])+?(?<!\s)\$(?!\w)"),  # $math$ (not $5, not $PATH)
     re.compile(r"\\\((?:.|\n)+?\\\)"),                         # \( math \)
     re.compile(r"!?\[[^\]\n]*\]\([^)\n]*\)"),                  # [link](url), ![img](url)
     re.compile(r"<https?://[^>\s]+>"),                         # <autolink>

@@ -97,9 +97,10 @@
         const close = src.indexOf("\\)", i + 2);
         if (close > 0) { out.push(token(src.slice(i + 2, close), false)); i = close + 2; continue; }
       }
-      // $inline$ — not "$5 and $10": no space just inside, no digit right after
+      // $inline$ — not "$5 and $10" (no space just inside, no digit after) and
+      // not shell like "$HOME/bin:$PATH" (no letter right after the closing $)
       if (src[i] === "$") {
-        const m = src.slice(i).match(/^\$(?!\s)((?:\\.|[^$\n\\])+?)(?<!\s)\$(?!\d)/);
+        const m = src.slice(i).match(/^\$(?!\s)((?:\\.|[^$\n\\])+?)(?<!\s)\$(?![\w])/);
         if (m) { out.push(token(m[1], false)); i += m[0].length; continue; }
       }
       out.push(src[i]);

@@ -1,0 +1,14 @@
+# dsh-plugin-known-manage — host entry.
+#
+# `id` is the cordis entry id; `name` is the package the entry mounts. The
+# browser bundle route is built from the package name, which is why
+# src/client.js registers under `dsh-plugin-known-manage`.
+- insert:
+    - id: known-manage
+      name: dsh-plugin-known-manage
+      config:
+        # The known_manage checkout. Empty = the folder this plugin sits in
+        # (src/host.js resolves it from its own path), or $KM_HOME.
+        workspace: !!js process.env.KM_HOME ?? ''
+        # First port tried for the knowledge-base server; scans upward if taken.
+        port: 8795
