@@ -48,7 +48,7 @@
     document.querySelectorAll(".view").forEach(v => v.classList.toggle("on", v.id === "v-" + view));
     document.querySelectorAll("#tabs button").forEach(b => b.classList.toggle("on", b.dataset.view === view));
     if (view === "cards") loadCards();
-    if (view === "map") drawMap().then(() => { if (!localStorage.getItem("km-map-view")) fitMap(); });
+    if (view === "map") drawMap().then(() => { if (expandAll || !localStorage.getItem("km-map-view")) fitMap(); });
     if (view === "board") drawBoard();
   }
   document.querySelectorAll("#tabs button").forEach(b => b.onclick = () => show(b.dataset.view));
@@ -96,6 +96,9 @@
   if (params.get("mode") === "side") document.body.classList.add("side");
   if (params.get("cwd")) $("imp-folder").value = params.get("cwd");
   if (params.get("source")) { S.sid = +params.get("source"); S.cur = 0; S.view = "sift"; }
+  // ?view=map&expand=1 opens straight onto the whole tree, every branch unfolded.
+  if (["sift", "cards", "map", "board"].includes(params.get("view"))) S.view = params.get("view");
+  const expandAll = params.get("expand") === "1";
   // The host page (dsh) tells us when it just put something in: show it.
   window.addEventListener("message", async e => {
     const d = e.data;
@@ -642,6 +645,7 @@
     catch (e) { err.hidden = false; err.textContent = "拒绝渲染（层级结构不合格）：\n" + e.message; return; }
     const { nodes, structure: { root, entries }, refs } = mapData;
     if (!mapOpen.size) mapOpen.add(root);
+    if (expandAll && !drawMap.expanded) { Object.keys(entries).forEach(id => mapOpen.add(id)); drawMap.expanded = true; }
     if (!mapSel || !nodes[mapSel]) mapSel = root;
     const kids = id => Object.keys(entries).filter(k => entries[k].parent === id).sort((a, b) => entries[a].order - entries[b].order);
 
