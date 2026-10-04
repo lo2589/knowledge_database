@@ -47,6 +47,22 @@ class Api:
             return self.repos.forget(body.get("path", ""))
 
         s = self.store
+        # One screen: the chat picks sentences, the graph shows and edits.
+        if parts == ["canvas"]:
+            return s.canvas()
+        if parts == ["target"] and method == "GET":
+            return {"target": s.target()}
+        if parts == ["target"] and method == "POST":
+            return {"target": s.set_target(int(body["id"]))}
+        if parts == ["split"] and method == "POST":
+            from .split import split_markdown
+            return [{"kind": u.kind, "text": u.text} for u in split_markdown(str(body.get("text", "")))]
+        if parts == ["pick"] and method == "POST":
+            parent = body.get("parent")
+            return s.pick(body.get("text", ""), body.get("origin") or {}, None if parent is None else int(parent),
+                          body.get("title", ""))
+        if parts == ["picked"]:
+            return s.picked(query.get("message", [""])[0])
         if parts == ["meta"]:
             return {"relations": RELATIONS, "checks": CHECKS, "stats": s.stats(),
                     "repo": Path(self.repos.path).stem if self.repos.path else ""}
@@ -118,6 +134,14 @@ class Api:
             docs = [Document(body.get("title") or "对话", body.get("format") or "dsh", msgs)]
         elif body.get("folder"):
             docs, skipped = load_folder(body["folder"])
+        elif body.get("path"):
+            p = Path(str(body["path"])).expanduser()
+            if p.is_dir():
+                docs, skipped = load_folder(str(p))
+            elif p.is_file():
+                docs = load_bytes(p.name, p.read_bytes())
+            else:
+                raise ValueError(f"找不到 {p}")
         elif body.get("claude_session"):
             path = Path(body["claude_session"]).expanduser()
             root = (self.claude_root or Path.home() / ".claude" / "projects").resolve()

@@ -59,6 +59,16 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def auto_title(body: str, limit: int = 40) -> str:
+    """A title for a card nobody named: the first line that says something.
+    A picked code block is named by its first line of code, not "[代码]"."""
+    m = re.match(r"\s*(`{3,}|~{3,})([\w+-]*)\n(.*?)(\n\1|$)", body, re.S)
+    if m:
+        first = next((l.strip() for l in m.group(3).splitlines() if l.strip()), "")
+        return plain(f"代码{('（' + m.group(2) + '）') if m.group(2) else ''}：{first}", limit)
+    return plain(body, limit)
+
+
 def plain(md: str, limit: int = 80) -> str:
     """One-line plain-text preview of Markdown, for FastNode's summary field."""
     text = re.sub(r"```.*?```", " [代码] ", md, flags=re.S)
@@ -66,7 +76,8 @@ def plain(md: str, limit: int = 80) -> str:
     text = re.sub(r"\$\$.*?\$\$|\\\[.*?\\\]", " [公式] ", text, flags=re.S)
     text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " [图] ", text)
     text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    text = re.sub(r"[#>*`|]+|(?<!\w)_+|_+(?!\w)", " ", text)  # keep snake_case intact
+    text = re.sub(r"\*{1,3}|(?<!\w)_{1,3}(?=\S)|(?<=\S)_{1,3}(?!\w)|`", "", text)  # emphasis/code marks vanish, snake_case stays
+    text = re.sub(r"^\s*(#{1,6}|>)\s*|\|", " ", text, flags=re.M)
     text = re.sub(r"\s+", " ", text).strip()
     return (text[: limit - 1] + "…") if len(text) > limit else (text or "（空）")
 
@@ -196,7 +207,7 @@ class KnowledgeStore:
             parent = self.root if parent is None else parent
             self._need(parent, "card")
             t = now_ms()
-            title = title.strip() or plain(body, 40)
+            title = title.strip() or auto_title(body)
             cid = self.db.create({"type": "card", "summary": plain(title, 120),
                                   "attrs": {"title": title, "body": body, "created": t, "updated": t}})
             for uid in unit_ids:
@@ -522,13 +533,114 @@ class KnowledgeStore:
                 if u is None:
                     continue
                 src = self.db.get(u["attrs"]["source"], links="none")
+                sa = src["attrs"] if src else {}
                 origins.append({"unit": u["id"], "text": u["attrs"]["text"], "source": u["attrs"]["source"],
-                                "source_title": src["attrs"]["title"] if src else "（资料已删除）"})
+                                "index": u["attrs"].get("order", 0),
+                                "source_title": sa.get("title", "（资料已删除）"),
+                                "dsh_session": sa.get("dsh_session"), "dsh_message": sa.get("dsh_message")})
         return {"id": cid, "title": a["title"], "body": a["body"], "created": a["created"],
                 "updated": a["updated"], "out": out_links, "in": in_links, "origins": origins,
                 "mentions_out": mentions_out, "mentions_in": mentions_in, "refs": refs,
                 "check": a.get("check", "unchecked"), "check_note": a.get("check_note", ""),
                 "x": a.get("x"), "y": a.get("y")}
+
+    # --- one screen: chat on the left picks, the graph on the right shows -------
+
+    def target(self) -> int:
+        """The card new picks hang under (what the graph shows as 挂载点)."""
+        with self.lock:
+            t = self.db.get(self.root, links="none")["attrs"].get("target")
+            n = self.db.get(t, links="none") if t else None
+            return t if n and n["type"] == "card" else self.root
+
+    def set_target(self, cid: int) -> int:
+        with self.lock:
+            self._need(cid, "card")
+            self.db.patch(self.root, {"attrs": {"target": cid}})
+            return cid
+
+    def pick(self, text: str, origin: dict, parent: int | None = None, title: str = "") -> dict:
+        """One sentence chosen in the chat becomes a card under `parent` (default:
+        the current target). The sentence is kept as a unit of a source for its
+        message, so the card links back to exactly where it was said."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("选中的内容是空的")
+        if origin.get("kind") != "dsh" or not origin.get("message"):
+            raise ValueError("origin 需要 kind=dsh 和 message")
+        parent = parent if parent is not None else self.target()
+        with self.lock:
+            msg, sess, idx = str(origin["message"]), str(origin.get("session", "")), int(origin.get("index", 0))
+            hit = self.db.query({"predicate": {"op": "and", "args": [
+                {"op": "eq", "field": "@type", "value": "source"},
+                {"op": "eq", "field": "/dsh_message", "value": msg}]}, "limit": 1})["ids"]
+            if hit:
+                sid = hit[0]
+            else:
+                q = (origin.get("question") or "对话").replace("\n", " ").strip()
+                sid = self.db.create({"type": "source", "summary": plain(q, 120),
+                                      "attrs": {"title": q[:80], "format": "dsh", "created": now_ms(),
+                                                "dsh_session": sess, "dsh_message": msg, "cwd": origin.get("cwd", "")}})
+            unit = self.db.query({"predicate": {"op": "and", "args": [
+                {"op": "eq", "field": "/source", "value": sid},
+                {"op": "eq", "field": "/order", "value": idx}]}, "limit": 1})["ids"]
+            if unit:
+                uid = unit[0]
+            else:
+                uid = self.db.create({"type": "unit", "summary": plain(text),
+                                      "attrs": {"source": sid, "order": idx, "message": 0, "speaker": "assistant",
+                                                "kind": "sentence", "text": text, "section": "", "status": "kept"}})
+                self.db.link(uid, "in_source", sid)
+        return self.create_card(title, text, [uid], parent)
+
+    def picked(self, message: str) -> dict:
+        """Which sentences of one chat message are already cards: {index: [card ids]}."""
+        with self.lock:
+            hit = self.db.query({"predicate": {"op": "and", "args": [
+                {"op": "eq", "field": "@type", "value": "source"},
+                {"op": "eq", "field": "/dsh_message", "value": str(message)}]}, "limit": 1})["ids"]
+            if not hit:
+                return {}
+            out = {}
+            for u in self.db.query({"predicate": {"op": "eq", "field": "/source", "value": hit[0]},
+                                    "include_data": True, "limit": 100000})["nodes"]:
+                cards = [l["id"] for l in self._links(u["id"])["in"] if l["relation"] == "from_unit"]
+                if cards:
+                    out[str(u["attrs"]["order"])] = cards
+            return out
+
+    def canvas(self) -> dict:
+        """Everything the single screen draws, in one read: every card with its
+        place in the tree, content, check, origins and relations; the imported
+        sources (their sentences are pickable on the canvas); the target."""
+        data = self.structure()  # validates the tree; raises if broken
+        target = self.target()
+        with self.lock:
+            entries = data["structure"]["entries"]
+            nodes = {}
+            for key, e in entries.items():
+                cid = int(key[1:])
+                c = self._card(cid)
+                kids = sorted((k for k, x in entries.items() if x["parent"] == key), key=lambda k: entries[k]["order"])
+                original = "\n\n".join(o["text"] for o in c["origins"])
+                nodes[cid] = {
+                    "id": cid, "title": c["title"], "body": c["body"], "check": c["check"],
+                    "check_note": c["check_note"], "level": e["level"], "order": e["order"],
+                    "parent": int(e["parent"][1:]) if e["parent"] else None,
+                    "children": [int(k[1:]) for k in kids], "root": cid == self.root,
+                    "origins": c["origins"], "edited": bool(c["origins"]) and c["body"].strip() != original.strip(),
+                    "out": c["out"], "in": c["in"], "mentions_out": c["mentions_out"], "refs": c["refs"],
+                    "x": c["x"], "y": c["y"], "updated": c["updated"], "created": c["created"],
+                }
+            sources = []
+            res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "source"},
+                                 "order_by": {"field": "/created", "direction": "desc"}, "include_data": True, "limit": 1000})
+            for n in res["nodes"]:
+                if n["attrs"].get("format") == "dsh":
+                    continue  # their text lives in the chat on the left
+                sources.append({"id": n["id"], "title": n["attrs"]["title"]})
+            return {"root": self.root, "target": target, "nodes": nodes, "sources": sources,
+                    "refs": [{"from": int(r["from"][1:]), "to": int(r["to"][1:]), "relation": r["relation"]} for r in data["refs"]]}
 
     def _resolve(self, target: str) -> int | None:
         """[[target]] → card id: "#12" by id, otherwise by exact title."""

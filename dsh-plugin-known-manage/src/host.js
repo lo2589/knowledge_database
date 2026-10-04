@@ -195,6 +195,27 @@ module.exports = {
       }
     }
 
+    function kmGet(p) {
+      return new Promise((resolve, reject) => {
+        http.get({ host: '127.0.0.1', port: state.port, path: p, timeout: 30000 }, (res) => {
+          let out = ''
+          res.setEncoding('utf8')
+          res.on('data', (c) => { out += c })
+          res.on('end', () => { try { const d = JSON.parse(out); res.statusCode === 200 ? resolve(d) : reject(new Error(d.error || 'HTTP ' + res.statusCode)) } catch (e) { reject(e) } })
+        }).on('error', reject)
+      })
+    }
+
+    // The question a picked sentence answered: the user turn holding this
+    // message, so the card's source reads as what you asked.
+    function questionFor(sessionId, messageId) {
+      try {
+        const events = readEvents(findSession(sessionsDir, sessionId))
+        const t = turns(events).find((x) => x.assistant.some((a) => a.id === messageId))
+        return { question: (t && t.user) || '', cwd: sessionInfo(events).cwd }
+      } catch (e) { return { question: '', cwd: '' } }
+    }
+
     function kmPost(p, body) {
       return new Promise((resolve, reject) => {
         const data = Buffer.from(JSON.stringify(body))
@@ -243,7 +264,7 @@ module.exports = {
             const body = await readBody(req)
             if (!state.port) await start()
             const m = messagesFor(sessionsDir, body.sessionId, body.messageId, body.scope)
-            const made = await kmPost('/api/sources', { messages: m.messages, title: m.title, format: 'dsh' })
+            const made = await kmPost('/api/sources', { messages: m.messages, title: m.title, format: 'dsh-turn' })
             const src = made.sources[0]
             send(res, 200, { ok: true, source: src.id, units: src.units, title: src.title, cwd: m.cwd })
           } catch (e) {
@@ -251,6 +272,41 @@ module.exports = {
           }
         },
       }), 'known-manage:ingest')
+
+      // The chat side: split an answer into pickable sentences, turn one into
+      // a card, and report which ones already are.
+      ctx.effect(() => server.register({
+        kind: 'exact', path: '/plugins/known-manage/split',
+        handler: async (req, res) => {
+          try { if (!state.port) await start(); send(res, 200, await kmPost('/api/split', await readBody(req))) }
+          catch (e) { send(res, 400, { error: String(e && e.message || e) }) }
+        },
+      }), 'known-manage:split')
+
+      ctx.effect(() => server.register({
+        kind: 'exact', path: '/plugins/known-manage/pick',
+        handler: async (req, res) => {
+          try {
+            const b = await readBody(req)
+            if (!b.sessionId || !b.messageId || !b.text) throw new Error('缺少 sessionId / messageId / text')
+            const q = questionFor(b.sessionId, b.messageId)
+            const card = await kmPost('/api/pick', { text: b.text, origin: {
+              kind: 'dsh', session: b.sessionId, message: b.messageId, index: b.index, question: q.question, cwd: q.cwd } })
+            send(res, 200, { ok: true, card: card.id, title: card.title })
+          } catch (e) { send(res, 400, { ok: false, error: String(e && e.message || e) }) }
+        },
+      }), 'known-manage:pick')
+
+      ctx.effect(() => server.register({
+        kind: 'exact', path: '/plugins/known-manage/picked',
+        handler: async (req, res) => {
+          try {
+            const id = new URL(req.url, 'http://x').searchParams.get('message') || ''
+            const [picked, target] = await Promise.all([kmGet('/api/picked?message=' + encodeURIComponent(id)), kmGet('/api/target')])
+            send(res, 200, { picked, target: target.target })
+          } catch (e) { send(res, 400, { error: String(e && e.message || e) }) }
+        },
+      }), 'known-manage:picked')
 
       ctx.effect(() => server.register({
         kind: 'exact', path: '/plugins/known-manage/session',

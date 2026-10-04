@@ -295,7 +295,7 @@ class ApiTests(unittest.TestCase):
             self.opener.open(req, timeout=5)
         self.assertEqual(ctx.exception.code, 404)
         with self.opener.open(self.base + "/", timeout=5) as r:
-            self.assertIn("知识整理", r.read().decode())
+            self.assertIn("known-manage", r.read().decode())
 
 
 if __name__ == "__main__":
