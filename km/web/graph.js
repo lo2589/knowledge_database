@@ -166,50 +166,87 @@
     }
   }
 
-  // 活跃的那一段占住视野：它按 1:1 显示（缩到能放下它自己为止），别的分支不缩、也不抢
-  // 镜头——展开着的它们就落在视野边上，想看就平移过去，而不是把整张图缩成一小团。
-  function subtreeBox(id) {
-    const box = id => { const el = $("layer").querySelector(`.node[data-id="${id}"]`); return el && {
-      x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight }; };
-    const start = box(id);
-    if (!start) return null;
-    // 上级那一层也算进来：活跃的卡不能孤零零悬在一片空白里
-    const up = node(id).parent;
-    const parentBox = up != null ? box(up) : null;
-    let out = { x: start.x, y: start.y, right: start.x + start.w, bottom: start.y + start.h };
-    if (parentBox) {
-      out.x = Math.min(out.x, parentBox.x); out.y = Math.min(out.y, parentBox.y);
-      out.right = Math.max(out.right, parentBox.x + parentBox.w);
-      out.bottom = Math.max(out.bottom, parentBox.y + parentBox.h);
-    }
-    const folded = i => S.closedChildren.has(i) || S.closedTrees.has(i);
-    const walk = i => {
-      if (folded(i)) return;
-      node(i).children.forEach(c => {
-        const b = box(c);
-        if (b) {
-          out.x = Math.min(out.x, b.x); out.y = Math.min(out.y, b.y);
-          out.right = Math.max(out.right, b.x + b.w); out.bottom = Math.max(out.bottom, b.y + b.h);
-        }
-        walk(c);
-      });
-    };
-    walk(id);
-    return { x: out.x, y: out.y, w: out.right - out.x, h: out.bottom - out.y };
+  // 一张元素在「图层坐标」里的位置和大小。
+  // 不能用 offsetLeft/offsetTop：资料句子是 .source 的子元素，offsetLeft 是相对
+  // 那份资料的，拿它去算镜头就会跳到空无一物的地方（"地广行稀"的那次就是这么来的）。
+  function layerRect(el) {
+    const stage = $("stage").getBoundingClientRect(), layer = $("layer").getBoundingClientRect();
+    const k = (S.view && S.view.k) || 1;
+    return { x: (el.getBoundingClientRect().left - layer.left) / k,
+             y: (el.getBoundingClientRect().top - layer.top) / k,
+             w: el.getBoundingClientRect().width / k, h: el.getBoundingClientRect().height / k };
   }
 
-  function focusActive() {
-    const id = S.data && S.data.target;
-    const spot = id != null ? subtreeBox(id) : null;
-    const st = $("stage");
+  // 画面里有多少是被内容盖住的（0 = 一片空白，1 = 铺满）。空白就是错误，这个数字
+  // 用来判它。
+  function contentFill() {
+    const st = $("stage").getBoundingClientRect();
+    let box = null;
+    $("layer").querySelectorAll(".node, .source").forEach(el => {
+      const r = el.getBoundingClientRect();
+      if (r.right < st.left || r.left > st.right || r.bottom < st.top || r.top > st.bottom) return;
+      const b = { x: Math.max(r.left, st.left), y: Math.max(r.top, st.top),
+                  r: Math.min(r.right, st.right), b: Math.min(r.bottom, st.bottom) };
+      box = box ? { x: Math.min(box.x, b.x), y: Math.min(box.y, b.y),
+                    r: Math.max(box.r, b.r), b: Math.max(box.b, b.b) } : b;
+    });
+    if (!box) return 0;
+    return ((box.r - box.x) * (box.b - box.y)) / Math.max(1, st.width * st.height);
+  }
+
+  // 画面外还有没有东西：只有"确实有内容没显示出来"才需要重新取景，否则一个小库
+  // 本来就填不满屏幕，来回重取景只会晃。
+  function offscreenContent() {
+    const st = $("stage").getBoundingClientRect();
+    return [...$("layer").querySelectorAll(".node, .source")].some(el => {
+      const r = el.getBoundingClientRect();
+      return r.right < st.left || r.left > st.right || r.bottom < st.top || r.top > st.bottom;
+    });
+  }
+
+  // 以某张卡为中心填满画面：先算它（和它上面一层），不够多就把最近的卡一张张拉进来，
+  // 直到画面被内容占住。远处的分支永远不进画面——所以既不会"地广行稀"，也不会让别的
+  // 分支把活跃的那段挤没了。
+  function focusOn(id) {
+    const st = $("stage"), layer = $("layer");
+    const seed = $("layer").querySelector(`.node[data-id="${id}"]`);
+    const els = [...layer.querySelectorAll(".node, .source")];
+    if (!seed || !els.length || !st.clientWidth) return fitAll();
+    const pad = 26, W = Math.max(1, st.clientWidth - pad * 2), H = Math.max(1, st.clientHeight - pad * 2);
+    const rectOf = el => layerRect(el);
+    const union = (a, b) => ({ x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
+                               w: Math.max(a.x + a.w, b.x + b.w) - Math.min(a.x, b.x),
+                               h: Math.max(a.y + a.h, b.y + b.h) - Math.min(a.y, b.y) });
+    const measure = box => {
+      const k = Math.max(MIN_K, Math.min(1, W / Math.max(1, box.w), H / Math.max(1, box.h)));
+      return { k, fill: (Math.min(W, box.w * k) / W) * (Math.min(H, box.h * k) / H) };
+    };
+    const start = rectOf(seed);
+    const up = node(id).parent;
+    let box = up != null ? union(start, rectOf($("layer").querySelector(`.node[data-id="${up}"]`)))
+                         : { x: start.x, y: start.y, w: start.w, h: start.h };
+    const cx = start.x + start.w / 2, cy = start.y + start.h / 2;
+    const others = els.map(rectOf).filter(r => r.x !== start.x || r.y !== start.y)
+      .sort((a, b) => Math.hypot(a.x + a.w / 2 - cx, a.y + a.h / 2 - cy) - Math.hypot(b.x + b.w / 2 - cx, b.y + b.h / 2 - cy));
+    let m = measure(box);
+    for (const r of others) {
+      if (m.fill >= 0.45) break;         // 画面已经被内容占住了，够了
+      box = union(box, r);
+      m = measure(box);
+    }
     S.needFit = false;
     S.needFocus = false;
-    if (!spot || !st.clientWidth) return fitAll();
-    const pad = 26;
-    const k = Math.max(MIN_K, Math.min(1, (st.clientWidth - pad * 2) / Math.max(1, spot.w),
-                                        (st.clientHeight - pad * 2) / Math.max(1, spot.h)));
-    S.view = { k, x: pad - spot.x * k, y: pad - spot.y * k };
+    S.view = { k: m.k, x: pad - box.x * m.k, y: pad - box.y * m.k };
     applyView();
+  }
+
+  function focusActive() { focusOn(S.data && S.data.target); }
+
+  // 一张卡要看得到，而且画面不能因此变空：先最小位移把它带进来；画面还是大面积为空，
+  // 就以它为中心重新填满。
+  function revealNicely(id) {
+    keepInView(id);
+    if (contentFill() < 0.3 && offscreenContent()) focusOn(id);
   }
 
   // Jump between the hits, the way a text editor's find does: next and previous,
@@ -518,49 +555,23 @@
     // when 自适应 was pressed on purpose.
     if (S.needFit) fitAll();
     else if (S.needFocus || !S.view) focusActive();
-    else { applyView(); if (!viewShowsSomething()) focusActive(); }
+    else { applyView(); if (contentFill() < 0.25 && offscreenContent()) focusActive(); }
     applyOutline();
     renderRelationIndex();
     fitMathToCards();
     reportMathCheck();
   }
 
-  // Is any card or imported source actually inside the pane right now? After a
-  // panel resize or a re-layout, a remembered view can end up looking at nothing.
-  function viewShowsSomething() {
-    const st = $("stage"), s = st.getBoundingClientRect();
-    return [...$("layer").querySelectorAll(".node, .source")].some(el => {
-      const r = el.getBoundingClientRect();
-      return r.bottom > s.top + 4 && r.top < s.bottom - 4 && r.right > s.left + 4 && r.left < s.right - 4;
-    });
-  }
-
-  // The constraint: a formula is always shown whole. A card first grows to fit
-  // it; what is still too wide for the widest card is scaled down until it fits
-  // (never below MIN_MATH_K — past that it scrolls rather than becoming unreadable).
-  const MIN_MATH_K = 0.55;
-  function fitMathToCards() {
-    $("layer").querySelectorAll(".node .math-block").forEach(el => {
-      const inner = el.firstElementChild;
-      if (!inner) return;
-      inner.style.transform = ""; el.style.height = "";
-      const over = el.scrollWidth - el.clientWidth;
-      if (over <= 0) return;
-      const k = Math.max(MIN_MATH_K, el.clientWidth / el.scrollWidth);
-      inner.style.transformOrigin = "left top";
-      inner.style.transform = `scale(${k})`;
-      el.style.height = Math.ceil(inner.offsetHeight * k) + "px";
-    });
-  }
-
   function relationDescription(k) {
     return ({belongs_to:"上下级，唯一父级", prerequisite:"理解顺序", example_of:"具体实例", refines:"补充细化", contradicts:"冲突信息", related:"无方向关联", mentions:"正文 [[提及]] 自动维护"})[k] || "";
   }
+
   function relationLabels(n) {
     const counts = {};
     [...n.out, ...n.in].forEach(l => { counts[l.relation] = (counts[l.relation] || 0) + 1; });
     return Object.entries(counts).map(([k, v]) => `${REL[k] || k} ${v}`).join(" · ") || "无额外关系";
   }
+
   function renderOutliner() {
     const d = S.data, layer = $("layer"), rows = [];
     $("stage").classList.add("outliner-stage");
@@ -591,6 +602,7 @@
     label.onclick = () => focusActive();
     emptyHint(); renderLegend(); applyOutline();
   }
+
   function renderRelationIndex() {
     const box = $("relation-index");
     if (!box) return;
@@ -643,6 +655,20 @@
       S.selectedRef = null;
     };
     panel.querySelector("[data-edge-close]").onclick = () => { S.selectedRef = null; renderEdgePanel(); };
+  }
+
+  function fitMathToCards() {
+    $("layer").querySelectorAll(".node .math-block").forEach(el => {
+      const inner = el.firstElementChild;
+      if (!inner) return;
+      inner.style.transform = ""; el.style.height = "";
+      const over = el.scrollWidth - el.clientWidth;
+      if (over <= 0) return;
+      const k = Math.max(MIN_MATH_K, el.clientWidth / el.scrollWidth);
+      inner.style.transformOrigin = "left top";
+      inner.style.transform = `scale(${k})`;
+      el.style.height = Math.ceil(inner.offsetHeight * k) + "px";
+    });
   }
 
   // Tidy top-down tree, the way the whole thing was designed: each subtree as
@@ -1195,8 +1221,9 @@
     const el = $("layer").querySelector(`.node[data-id="${id}"]`), st = $("stage");
     if (!el || !S.view) return;
     const s = st.getBoundingClientRect(), k = S.view.k || 1, pad = 12;
-    const left = el.offsetLeft * k + S.view.x, right = left + el.offsetWidth * k;
-    const top = el.offsetTop * k + S.view.y, bottom = top + el.offsetHeight * k;
+    const spot = layerRect(el);
+    const left = spot.x * k + S.view.x, right = left + spot.w * k;
+    const top = spot.y * k + S.view.y, bottom = top + spot.h * k;
     let moved = false;
     if (left < pad) { S.view.x += pad - left; moved = true; }
     else if (right > st.clientWidth - pad) { S.view.x -= right - (st.clientWidth - pad); moved = true; }
@@ -1214,7 +1241,7 @@
   function showNew(id) {
     const el = $("layer").querySelector(`.node[data-id="${id}"]`);
     if (!el) return;
-    keepInView(id);
+    revealNicely(id);
     flash(id);
   }
   function centerEl(el) {
@@ -1222,9 +1249,10 @@
     const st = $("stage"), s = st.getBoundingClientRect(), r = el.getBoundingClientRect();
     if (r.top >= s.top + 8 && r.bottom <= s.bottom - 8 && r.left >= s.left + 8 && r.right <= s.right - 8) return;
     if (!S.view) S.view = { k: 1, x: 0, y: 0 };
+    const spot = layerRect(el);            // 用图层坐标，资料里的句子也算得准
     const k = S.view.k;
-    S.view.x = st.clientWidth / 2 - (el.offsetLeft + Math.min(el.offsetWidth, st.clientWidth - 40) / 2) * k;
-    S.view.y = 48 - el.offsetTop * k;
+    S.view.x = st.clientWidth / 2 - (spot.x + Math.min(spot.w, st.clientWidth - 40) / 2) * k;
+    S.view.y = 48 - spot.y * k;
     applyView();
   }
   function flash(id) {
@@ -1526,6 +1554,7 @@
       reveal(hit.id);
       render();
       center(hit.id);
+      if (contentFill() < 0.3 && offscreenContent()) focusOn(hit.id);
       flash(hit.id);
       return;
     }
@@ -1533,6 +1562,7 @@
     const el = $("layer").querySelector(`[data-unit="${hit.uid}"], [data-legacy="${hit.uid}"]`);
     if (!el) return say("这段资料已经删掉了");
     centerEl(el);
+    if (contentFill() < 0.3 && offscreenContent()) return fitAll();
     el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
   }
   function runSearch() {

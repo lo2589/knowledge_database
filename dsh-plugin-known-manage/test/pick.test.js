@@ -87,7 +87,14 @@ async function boot(t) {
   if (!await waitFor(`${base}/api/version`)) return null
   const routes = new Map()
   require('../src/host.js').apply(fakeContext(routes), { port, workspace: ROOT, sessions })
-  await waitFor(`${base}/api/version`)   // start() reuses the server we started
+  // The plugin probes for a server and adopts ours; a request before that has no
+  // port to go to. Wait until it says it has one.
+  for (let n = 0; n < 40; n++) {
+    const res = fakeRes()
+    await routes.get('/plugins/known-manage/status')(Readable.from([]), res)
+    if (res.out.body && res.out.body.port) break
+    await new Promise((r) => setTimeout(r, 250))
+  }
   return { base, routes }
 }
 

@@ -170,6 +170,14 @@ module.exports = {
       }
     }
 
+    // Every route that talks to the knowledge server waits for it: before the
+    // first probe answers there is no port, and a request would go to port 80
+    // ("connect ECONNREFUSED 127.0.0.1:80") instead of the library.
+    async function ready() {
+      if (!state.port || !alive()) await start()
+      if (!state.port) throw new Error(state.error || '知识库还没起来')
+    }
+
     function kmGet(p) {
       return new Promise((resolve, reject) => {
         http.get({ host: '127.0.0.1', port: state.port, path: p, timeout: 30000 }, (res) => {
@@ -238,7 +246,7 @@ module.exports = {
       ctx.effect(() => server.register({
         kind: 'exact', path: '/plugins/known-manage/split',
         handler: async (req, res) => {
-          try { if (!state.port) await start(); send(res, 200, await kmPost('/api/split', await readBody(req))) }
+          try { await ready(); send(res, 200, await kmPost('/api/split', await readBody(req))) }
           catch (e) { send(res, 400, { error: String(e && e.message || e) }) }
         },
       }), 'known-manage:split')
@@ -247,6 +255,7 @@ module.exports = {
         kind: 'exact', path: '/plugins/known-manage/pick',
         handler: async (req, res) => {
           try {
+            await ready()
             const b = await readBody(req)
             if (!b.sessionId || !b.messageId || !b.text) throw new Error('缺少 sessionId / messageId / text')
             const q = questionFor(b.sessionId, b.messageId)
@@ -267,6 +276,7 @@ module.exports = {
         kind: 'exact', path: '/plugins/known-manage/pick-many',
         handler: async (req, res) => {
           try {
+            await ready()
             const b = await readBody(req)
             const items = (Array.isArray(b.items) ? b.items : []).filter((it) => it && it.text)
             if (!b.sessionId || !items.length) throw new Error('缺少 sessionId / items')
@@ -304,6 +314,7 @@ module.exports = {
         kind: 'exact', path: '/plugins/known-manage/picked',
         handler: async (req, res) => {
           try {
+            await ready()
             const q = new URL(req.url, 'http://x').searchParams
             const id = q.get('message') || '', sq = '&s=' + encodeURIComponent(q.get('s') || '')
             const [picked, target] = await Promise.all([kmGet('/api/picked?message=' + encodeURIComponent(id) + sq), kmGet('/api/target?x=1' + sq)])
