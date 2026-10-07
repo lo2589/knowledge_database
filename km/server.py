@@ -6,6 +6,7 @@ Binds to 127.0.0.1 only; nothing here is meant to face a network.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import mimetypes
 import os
@@ -23,6 +24,28 @@ from .store import CHECKS, RELATIONS, KnowledgeStore
 
 WEB = Path(__file__).parent / "web"
 MAX_BODY = 64 * 1024 * 1024
+# Images you paste or drop into a card live beside the libraries, named by their
+# own content, so the same picture twice is one file.
+IMAGES = Path(__file__).resolve().parent.parent / "data" / "images"
+MAX_IMAGE = 12 * 1024 * 1024
+IMAGE_NAME = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+
+
+def sniff_image(data: bytes) -> tuple[str, str] | None:
+    """What kind of image these bytes are, or None when they are not one.
+
+    The type comes from the content, never from what a browser claims: a file
+    that says it is a png but is not one is refused.
+    """
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif", ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None
 # Where a page's self-report lands (see Api.route's "diag" branch).
 DIAG_PATH = Path(__file__).resolve().parent.parent / "data" / "repos" / "diag.json"
 # Codex conversations driven by the web page (see km/chat.py).
@@ -63,6 +86,8 @@ class Api:
         self.claude_root = claude_root
         # Where Codex conversations are kept (tests point this at a temp dir).
         self.chats_home = CHATS_HOME
+        # Where pasted images are kept (tests point this at a temp dir).
+        self.images_home = IMAGES
         # The port this server is bound to: the PDF is rendered by a browser that
         # has to fetch the print page from here. serve() fills it in.
         self.port = 0
@@ -116,6 +141,10 @@ class Api:
             return chats.load(self.chats_home, parts[1])
         if parts == ["chat"] and method == "POST":
             return self._chat_turn(body)
+
+        # A picture pasted into a card, dropped on the board, or given as a path.
+        if parts == ["images"] and method == "POST":
+            return self._save_image(body)
 
         if sessioned:
             s, repo_path = self.repos.store_for(session, title)
@@ -211,6 +240,46 @@ class Api:
             return s.graph()
         raise LookupError(f"没有这个接口：{method} {path}")
 
+    def _save_image(self, body: dict) -> dict:
+        """Keep one image and hand back the Markdown that shows it.
+
+        @param body - {"data_b64": …, "name": …} from a paste or a drop, or
+            {"path": …} for a file that is already on this machine.
+        @returns {"url", "markdown", "name", "bytes"}.
+        @throws ValueError when there is nothing usable, or it is too big.
+        """
+        label = "image"
+        if body.get("path"):
+            given = Path(str(body["path"])).expanduser()
+            if not given.is_file():
+                raise ValueError(f"找不到图片：{given}")
+            data, label = given.read_bytes(), given.name
+        else:
+            raw = str(body.get("data_b64") or "")
+            if not raw:
+                raise ValueError("没有图片内容")
+            try:
+                data = base64.b64decode(raw.split(",")[-1], validate=False)
+            except Exception as exc:
+                raise ValueError(f"图片内容读不出来：{exc}") from exc
+            label = str(body.get("name") or label)
+        if not data:
+            raise ValueError("图片是空的")
+        if len(data) > MAX_IMAGE:
+            raise ValueError(f"图片太大（{len(data) // 1024 // 1024}MB，上限 {MAX_IMAGE // 1024 // 1024}MB）")
+        sniffed = sniff_image(data)
+        if not sniffed:
+            raise ValueError("只收 png / jpeg / gif / webp 图片")
+        mime, ext = sniffed
+        name = hashlib.sha1(data).hexdigest()[:16] + ext
+        folder = Path(self.images_home)
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / name
+        if not path.exists():
+            path.write_bytes(data)
+        return {"url": "/images/" + name, "markdown": f"![]({'/images/' + name})",
+                "name": name, "bytes": len(data), "from": label, "type": mime}
+
     def _chat_turn(self, body: dict) -> Stream:
         """Run one turn of a Codex conversation and stream what it says.
 
@@ -237,8 +306,16 @@ class Api:
         if sandbox not in ("read-only", "workspace-write"):
             raise ValueError("sandbox 只能是 read-only / workspace-write")
         model = str(body.get("model") or os.environ.get("KM_CODEX_MODEL") or "") or None
+        # Pictures attached to the question: they live in the images folder, and
+        # Codex is handed their paths (never anything the caller spells out).
+        folder = Path(self.images_home)
+        images = []
+        for name in (body.get("images") or [])[:8]:
+            name = Path(str(name)).name
+            if IMAGE_NAME.match(name) and (folder / name).is_file():
+                images.append(str((folder / name).resolve()))
         turn = codex.start(prompt, thread=record.get("thread") or None, cwd=cwd or None,
-                           model=model, sandbox=sandbox)
+                           model=model, sandbox=sandbox, images=images)
         record["cwd"] = cwd or record.get("cwd", "")
         record["sandbox"] = sandbox
         return Stream(self._chat_events(record, prompt, turn))
@@ -268,7 +345,7 @@ class Api:
         finally:
             text = "\n\n".join(a for a in answer if a).strip()
             record.setdefault("turns", []).append({
-                "q": prompt, "a": text, "at": int(_time.time() * 1000),
+                "q": prompt, "images": [Path(p).name for p in getattr(turn, "images", [])], "a": text, "at": int(_time.time() * 1000),
                 "reasoning": "\n\n".join(r for r in reasoning if r)[:4000],
                 "tools": tools[:40], "usage": usage, "error": failed,
             })
@@ -398,6 +475,16 @@ def make_handler(api: Api):
                 self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
 
         def _static(self, path: str):
+            # Pictures pasted into cards: one flat name inside the images folder,
+            # never a path that could climb out of it.
+            if path.startswith("/images/"):
+                name = path[len("/images/"):]
+                folder = Path(api.images_home).resolve()
+                target = (folder / name).resolve()
+                if not IMAGE_NAME.match(name) or folder not in target.parents or not target.is_file():
+                    return self._send(404, {"error": "not found"})
+                ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                return self._send(200, target.read_bytes(), ctype)
             page = {"/print": "print.html", "/print/": "print.html", "/chat": "chat.html", "/chat/": "chat.html"}
             rel = "index.html" if path in ("", "/") else page.get(path, path.lstrip("/"))
             target = (WEB / rel).resolve()

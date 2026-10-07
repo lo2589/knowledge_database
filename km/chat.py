@@ -63,7 +63,8 @@ def find_codex() -> str | None:
 
 
 def command(prompt_file: bool, thread: str | None = None, cwd: str | None = None,
-            model: str | None = None, sandbox: str = "read-only") -> list[str]:
+            model: str | None = None, sandbox: str = "read-only",
+            images: list[str] | None = None) -> list[str]:
     """The argv for one turn.
 
     The first turn of a conversation starts a thread and fixes the working
@@ -84,6 +85,8 @@ def command(prompt_file: bool, thread: str | None = None, cwd: str | None = None
         if cwd:
             argv += ["-C", cwd]
     argv += ["--skip-git-repo-check", "--json"]
+    for image in images or []:          # 图片附件：Codex 自己会看
+        argv += ["-i", str(image)]
     if model:
         argv += ["-m", model]
     argv += ["-"]                      # the prompt arrives on stdin
@@ -142,8 +145,10 @@ def _complaint(message: str) -> dict:
 class Turn:
     """One running turn: the child, its stderr tail, and how to stop it."""
 
-    def __init__(self, argv: list[str], prompt: str, cwd: str | None, timeout: int = DEFAULT_TIMEOUT):
+    def __init__(self, argv: list[str], prompt: str, cwd: str | None,
+                 images: list[str] | None = None, timeout: int = DEFAULT_TIMEOUT):
         self.argv = argv
+        self.images = [str(i) for i in (images or [])]
         self.timeout = timeout
         self.started = time.time()
         self.stderr: deque[str] = deque(maxlen=TAIL_LINES)
@@ -225,8 +230,12 @@ class Turn:
 
 def start(prompt: str, *, thread: str | None = None, cwd: str | None = None,
           model: str | None = None, sandbox: str = "read-only",
-          timeout: int = DEFAULT_TIMEOUT) -> Turn:
-    """Begin one turn and hand back the object that streams it."""
-    if not (prompt or "").strip():
+          images: list[str] | None = None, timeout: int = DEFAULT_TIMEOUT) -> Turn:
+    """Begin one turn and hand back the object that streams it.
+
+    @param images - absolute paths of pictures to send with the question.
+    """
+    if not (prompt or "").strip() and not images:
         raise ValueError("说点什么")
-    return Turn(command(True, thread=thread, cwd=cwd, model=model, sandbox=sandbox), prompt, cwd, timeout)
+    return Turn(command(True, thread=thread, cwd=cwd, model=model, sandbox=sandbox, images=images),
+                prompt, cwd, images, timeout)

@@ -24,11 +24,14 @@
     <div id="log"></div>
     <div id="composer">
       <textarea id="ask" rows="1" placeholder="问 Codex……（Enter 发送，Shift+Enter 换行）"></textarea>
+      <div id="attach-row" hidden></div>
       <div class="send-row">
         <span id="hint">回答里的每一句都能点：点了就挂到右边知识图的挂载点下面</span>
+        <button id="attach" title="给 Codex 发一张图（截图、示意图都行）">图片</button>
         <button id="stop" hidden>停止</button>
         <button id="send">发送</button>
       </div>
+      <input id="file" type="file" accept="image/png,image/jpeg,image/gif,image/webp" hidden>
     </div>
   </section>
   <div id="grip" title="拖动调整宽度"></div>

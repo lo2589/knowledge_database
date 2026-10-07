@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import stat
@@ -673,6 +674,79 @@ printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":12,"output_toke
 """
 
 
+PNG_1PX = ("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==")
+
+
+class ImageTests(unittest.TestCase):
+    """Pictures: pasted into a card, and served back to every page that draws it."""
+
+    def setUp(self):
+        from http.server import ThreadingHTTPServer
+        self.images = Path(tempfile.mkdtemp())
+        api = Api(KnowledgeStore(":memory:"))
+        api.images_home = self.images
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(api))
+        api.port = self.server.server_port
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def tearDown(self):
+        self.server.shutdown()
+
+    def call(self, method, path, body=None):
+        req = urllib.request.Request(self.base + path, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with self.opener.open(req, timeout=10) as r:
+                ctype = r.headers.get("Content-Type", "")
+                raw = r.read()
+                return r.status, json.loads(raw) if "json" in ctype else raw
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_an_image_is_kept_once_and_served_back(self):
+        code, out = self.call("POST", "/api/images", {"data_b64": PNG_1PX, "name": "shot.png"})
+        self.assertEqual(code, 200)
+        self.assertTrue(out["url"].startswith("/images/"), out)
+        self.assertEqual(out["markdown"], f"![]({out['url']})")
+        code, data = self.call("GET", out["url"])
+        self.assertEqual((code, data[:8]), (200, b"\x89PNG\r\n\x1a\n"))
+
+        # the same picture twice is one file
+        _, again = self.call("POST", "/api/images", {"data_b64": PNG_1PX, "name": "another-name.png"})
+        self.assertEqual(again["name"], out["name"])
+        self.assertEqual(len(list(self.images.iterdir())), 1)
+
+        # and a file already on this machine can be kept the same way
+        local = self.images.parent / "local.png"
+        local.write_bytes(base64.b64decode(PNG_1PX))
+        _, by_path = self.call("POST", "/api/images", {"path": str(local)})
+        self.assertEqual(by_path["name"], out["name"])
+
+    def test_only_real_images_are_taken(self):
+        code, out = self.call("POST", "/api/images", {"data_b64": base64.b64encode(b"<svg/>").decode()})
+        self.assertEqual(code, 400)
+        self.assertIn("png", out["error"])
+        self.assertEqual(self.call("POST", "/api/images", {"name": "x.png"})[0], 400)
+        code, out = self.call("POST", "/api/images", {"path": "/nope/missing.png"})
+        self.assertEqual(code, 400)
+        self.assertIn("找不到图片", out["error"])
+        from unittest import mock
+        from km import server as km_server
+        with mock.patch.object(km_server, "MAX_IMAGE", 10):
+            code, out = self.call("POST", "/api/images", {"data_b64": PNG_1PX})
+        self.assertEqual(code, 400)
+        self.assertIn("太大", out["error"])
+
+    def test_images_are_confined_to_their_folder(self):
+        self.assertEqual(self.call("GET", "/images/../../../etc/hosts")[0], 404)
+        self.assertEqual(self.call("GET", "/images/nope.png")[0], 404)
+        (self.images / "ok.png").write_bytes(b"\x89PNG\r\n\x1a\nxx")
+        self.assertEqual(self.call("GET", "/images/ok.png")[0], 200)
+
+
 class ChatTests(unittest.TestCase):
     """The Codex web page: one turn streams, gets saved, and resumes its thread."""
 
@@ -688,6 +762,7 @@ class ChatTests(unittest.TestCase):
         os.environ.update(self._env)
         api = Api(Repos(self.home))
         api.chats_home = self.chats
+        api.images_home = self.images = Path(tempfile.mkdtemp())
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(api))
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -783,6 +858,21 @@ class ChatTests(unittest.TestCase):
         self.assertEqual(origin["source_title"], "缩放点积是什么")
         code, picked = self.call("GET", "/api/picked?s=codex-test&message=codex-test-0-a")
         self.assertEqual((code, picked), (200, {"缩放点积先算 QK。": [card["id"]]}))
+
+    def test_a_picture_attached_to_a_question_reaches_codex(self):
+        code, up = self.call("POST", "/api/images", {"data_b64": PNG_1PX, "name": "shot.png"})
+        self.assertEqual(code, 200)
+        events = self.stream({"chat": "codex-image", "prompt": "这张图里是什么", "images": [up["name"]]})
+        self.assertIn("saved", [e["event"] for e in events])
+        argv = self.log.read_text(encoding="utf-8").strip().splitlines()[-1]
+        self.assertIn("-i", argv)
+        self.assertIn(up["name"], argv)
+        stored = json.loads((self.chats / "codex-image.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["turns"][0]["images"], [up["name"]])
+        # a name that is not a plain file name is never turned into a path
+        bad = self.stream({"chat": "codex-image", "prompt": "再一次", "images": ["../../etc/hosts"]})
+        self.assertIn("saved", [e["event"] for e in bad])
+        self.assertNotIn("hosts", self.log.read_text(encoding="utf-8").strip().splitlines()[-1])
 
     def test_a_missing_codex_cli_is_reported_in_plain_words(self):
         os.environ["KM_CODEX"] = "/nonexistent/codex"

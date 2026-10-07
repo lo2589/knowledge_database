@@ -1136,6 +1136,80 @@
     saveQuick(S.selected);
   };
   $("quick-body").onkeydown = e => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); $("quick-save").click(); } };
+  // ---------------------------------------------------------------- 图片
+  // 一张图可以粘进卡片、拖到画布上，或者用路径导入：图片存在服务端（按内容命名，
+  // 同一张图只存一份），卡片正文里留下一行 ![](/images/xxx.png)，渲染、导出、打印
+  // 都跟着走。
+  const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
+  const imageFiles = list => [...(list || [])].filter(f => f && (/^image\//.test(f.type || "") || IMAGE_EXT.test(f.name || "")));
+
+  async function uploadImage(file) {
+    const dataUrl = await new Promise((res, rej) => {
+      const fr = new FileReader();
+      fr.onload = () => res(String(fr.result));
+      fr.onerror = () => rej(new Error("读不出这个文件"));
+      fr.readAsDataURL(file);
+    });
+    return api("POST", "images", { data_b64: dataUrl, name: file.name || "image" });
+  }
+  function insertAtCaret(el, text) {
+    if (document.activeElement !== el && el.selectionStart === 0) {
+      el.value = String(el.value || "").replace(/\s*$/, "") + text;
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      return;
+    }
+    const start = el.selectionStart == null ? el.value.length : el.selectionStart;
+    const end = el.selectionEnd == null ? start : el.selectionEnd;
+    el.value = el.value.slice(0, start) + text + el.value.slice(end);
+    el.selectionStart = el.selectionEnd = start + text.length;
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+  const imageLine = (text, markdown) => (String(text || "").trim() ? "\n\n" : "") + markdown + "\n";
+
+  async function imageIntoTextarea(ta, file) {
+    const up = await uploadImage(file);
+    insertAtCaret(ta, imageLine(ta.value, up.markdown));
+    say("图片插进来了，保存就生效", true);
+  }
+  async function imageIntoCard(id, file) {
+    const up = await uploadImage(file);
+    const n = node(id);
+    await act(() => api("PATCH", `cards/${id}`, { body: String(n.body || "").trimEnd() + "\n\n" + up.markdown }),
+      "图片放进「" + n.title + "」了", id);
+  }
+  async function imageAsNewCard(file) {
+    const up = await uploadImage(file);
+    S.lastNew = null;
+    const ok = await act(async () => {
+      S.lastNew = (await api("POST", "cards", { title: "", body: up.markdown, units: [], parent: S.data.target })).id;
+    }, "图片做成了一张新卡，挂在「" + node(S.data.target).title + "」下", null);
+    if (ok && S.lastNew) { center(S.lastNew); flash(S.lastNew); }
+  }
+  // 同一个手势在哪儿都能用：编辑框里插到光标处，卡片上追加到这张卡，空白处开新卡。
+  async function handleImages(files, target) {
+    if (!files.length || !S.data) return;
+    const ta = target && target.tagName === "TEXTAREA" ? target : null;
+    if (ta) return imageIntoTextarea(ta, files[0]);
+    const card = target && target.closest ? target.closest(".node[data-id]") : null;
+    if (card && !node(+card.dataset.id).root) return imageIntoCard(+card.dataset.id, files[0]);
+    return imageAsNewCard(files[0]);
+  }
+  document.addEventListener("paste", e => {
+    const files = imageFiles(e.clipboardData && e.clipboardData.files);
+    if (!files.length || !S.data) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || /^(input|select)$/i.test(t.tagName || ""))) return;
+    e.preventDefault();
+    handleImages(files, t).catch(fail);
+  });
+  ["dragover", "drop"].forEach(ev => document.addEventListener(ev, e => {
+    const files = imageFiles(e.dataTransfer && e.dataTransfer.files);
+    if (!files.length || !S.data) return;
+    e.preventDefault();
+    if (ev === "dragover") return;
+    handleImages(files, e.target).catch(fail);
+  }));
+
   // ------------------------------------------------------------ exporting
   // Four shapes of the same library. The text is always shown here first: a
   // panel inside a frame must never answer an export with a silent download.
@@ -1326,6 +1400,19 @@
     if (e.key !== "Enter") return;
     const v = e.target.value.trim(); if (!v) return;
     const looksPath = /^(~|\/|[A-Za-z]:\\)/.test(v) && !v.includes("\n");
+    // 一个图片路径就是一张图卡，不走「资料」那条路
+    if (looksPath && IMAGE_EXT.test(v)) {
+      e.target.value = "";
+      try {
+        const up = await api("POST", "images", { path: v });
+        S.lastNew = null;
+        const ok = await act(async () => {
+          S.lastNew = (await api("POST", "cards", { title: "", body: up.markdown, units: [], parent: S.data.target })).id;
+        }, "图片做成了一张新卡", null);
+        if (ok && S.lastNew) { center(S.lastNew); flash(S.lastNew); }
+      } catch (err) { fail(err); }
+      return;
+    }
     try {
       const r = await api("POST", "sources", looksPath ? { path: v } : { text: v });
       e.target.value = "";

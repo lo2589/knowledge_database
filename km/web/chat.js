@@ -23,6 +23,7 @@
     abort: null,
     pending: null,      // the turn currently being streamed
     picked: new Map(),  // message id → {text: [card ids]}
+    images: [],         // pictures attached to the next question
   };
   const msgId = (n, who) => `${S.chat}-${n}-${who}`;
   const timeAgo = ms => { const s = (Date.now() - ms) / 1000; return s < 60 ? "刚刚" : s < 3600 ? `${s / 60 | 0} 分钟前` : s < 86400 ? `${s / 3600 | 0} 小时前` : `${s / 86400 | 0} 天前`; };
@@ -190,7 +191,8 @@
     S.turns.push(t);
     const el = turnEl(i);
     paintQuestion(el, t.q);
-    if (t.q) paintSentences(el.querySelector("[data-qbox]"), i, t.q, "user");
+    const shownQ = t.q + (t.images || []).map(n => (t.q ? "\n\n" : "") + "![](/images/" + n + ")").join("");
+    if (shownQ) paintSentences(el.querySelector("[data-qbox]"), i, shownQ, "user");
     if (t.reasoning) {
       const think = el.querySelector(".think");
       think.hidden = false;
@@ -206,10 +208,14 @@
   }
 
   // ------------------------------------------------------------- one turn
-  function liveTurn(q) {
+  function liveTurn(q, images) {
     const i = S.turns.length;
-    const el = paintQuestion(turnEl(i), q);
-    const live = { q, a: "", reasoning: "", tools: [], error: "", status: "", usage: {}, at: Date.now() };
+    const pics = images || [];
+    // The picture is part of the question: it shows in the bubble and can itself
+    // be picked into a card like any other sentence.
+    const shown = q + pics.map(n => (q ? "\n\n" : "") + "![](/images/" + n + ")").join("");
+    const el = paintQuestion(turnEl(i), shown);
+    const live = { q, images: pics, a: "", reasoning: "", tools: [], error: "", status: "", usage: {}, at: Date.now() };
     // the user's own question is pickable at once — no need to wait for an answer
     paintSentences(el.querySelector("[data-qbox]"), i, q, "user");
     return { index: i, el, live };
@@ -226,7 +232,9 @@
     box.value = ""; box.style.height = "";
     S.streaming = true;
     $("send").disabled = true; $("stop").hidden = false;
-    const { index, el, live } = liveTurn(prompt);
+    const { index, el, live } = liveTurn(prompt, S.images);
+    const attached = S.images.slice();
+    S.images = []; paintAttachments();
     const answer = el.querySelector("[data-answer]");
     let text = "";
     const paint = () => paintAnswer(el, text, true);
@@ -247,7 +255,7 @@
     try {
       const r = await fetch("/api/chat", {
         method: "POST", signal: ctl.signal, headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat: S.chat || undefined, prompt, cwd: S.cwd || undefined }),
+        body: JSON.stringify({ chat: S.chat || undefined, prompt, cwd: S.cwd || undefined, images: attached }),
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({ error: "HTTP " + r.status }));
@@ -320,6 +328,7 @@
       await loadPicked(index);
       const statusBox = done.querySelector(".status");
       if (statusBox) statusBox.hidden = !live.status || !!live.a;
+      if (live.images && live.images.length) paintSentences(done.querySelector("[data-qbox]"), index, live.q + live.images.map(n => "\n\n![](/images/" + n + ")").join(""), "user");
       if (live.a) paintSentences(done.querySelector("[data-answer]"), index, live.a, "assistant");
       else {
         paintAnswer(done, live.error ? "_（这一轮没拿到回答）_" : "_（这一轮没有回答，可能是网络超时）_", false);
@@ -510,6 +519,52 @@
     } catch (e) { panel.innerHTML += `<div class="head">读不到：${esc(e.message)}</div>`; }
   }
 
+  // One picture at a time is enough to make a question clearer; it goes to Codex
+  // itself (`codex exec -i`), not just into the log.
+  function paintAttachments() {
+    const row = $("attach-row");
+    row.hidden = !S.images.length;
+    row.innerHTML = "";
+    S.images.forEach((name, i) => {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      const img = document.createElement("img");
+      img.src = "/images/" + name;
+      const del = document.createElement("button");
+      del.textContent = "×"; del.title = "不带这张";
+      del.onclick = () => { S.images.splice(i, 1); paintAttachments(); };
+      chip.appendChild(img); chip.appendChild(del);
+      row.appendChild(chip);
+    });
+    $("attach").classList.toggle("active", !!S.images.length);
+  }
+  $("attach").onclick = () => $("file").click();
+  $("file").onchange = async e => {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    try {
+      const dataUrl = await new Promise((res, rej) => {
+        const fr = new FileReader();
+        fr.onload = () => res(String(fr.result));
+        fr.onerror = () => rej(new Error("读不出这个文件"));
+        fr.readAsDataURL(file);
+      });
+      const up = await api("POST", "images", { data_b64: dataUrl, name: file.name });
+      S.images.push(up.name);
+      paintAttachments();
+      toast("图加上了，发送时会一起给 Codex");
+    } catch (err) { toast("图片没加上：" + err.message); }
+  };
+  $("ask").onpaste = e => {
+    const file = [...((e.clipboardData && e.clipboardData.files) || [])].find(f => /^image\//.test(f.type || ""));
+    if (!file) return;
+    e.preventDefault();
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    $("file").files = dt.files;
+    $("file").onchange({ target: $("file") });
+  };
   $("send").onclick = ask;
   $("stop").onclick = () => { if (S.abort) S.abort.abort(); };
   $("new").onclick = newChat;

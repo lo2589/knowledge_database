@@ -60,6 +60,10 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent-soft
 #legend label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
 #legend i { display: inline-block; width: 16px; height: 3px; border-radius: 2px; }
 
+/* a picture in a card: never wider than the card, and never taller than a screen */
+.node img, .sent img, .origins-open img { max-width: 100%; height: auto; border-radius: 5px; display: block; margin: 3px 0; }
+.node img { max-height: 60vh; object-fit: contain; }
+
 /* a card */
 .node { position: absolute; background: var(--panel); border: 1px solid var(--line); border-top: 2px solid var(--line);
         border-radius: 9px; box-shadow: 0 1px 3px rgba(0,0,0,.06); cursor: default; }

@@ -13,6 +13,7 @@ const path = require('node:path')
 const zlib = require('node:zlib')
 const { Readable } = require('node:stream')
 const { spawn } = require('node:child_process')
+const net = require('node:net')
 
 const ROOT = path.join(__dirname, '..', '..')
 const PY = process.env.KM_PYTHON || 'python3'
@@ -55,11 +56,25 @@ function call(handler, body) {
   return handler(req, res).then(() => res.out)
 }
 
+// A port nobody else is using right now: a fixed range collides with whatever
+// else is running on this machine, and a test that fails for that reason teaches
+// nothing.
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.on('error', reject)
+    srv.listen(0, '127.0.0.1', () => {
+      const port = srv.address().port
+      srv.close(() => resolve(port))
+    })
+  })
+}
+
 // A knowledge server plus the host half, wired together the way dsh wires them.
 async function boot(t) {
   const repos = fs.mkdtempSync(path.join(os.tmpdir(), 'km-repos-'))
   const sessions = fs.mkdtempSync(path.join(os.tmpdir(), 'km-sessions-'))
-  const port = 24000 + Math.floor(Math.random() * 10000)
+  const port = await freePort()
   const base = `http://127.0.0.1:${port}`
   const child = spawn(PY, ['-m', 'km', '--port', String(port), '--repos', repos], { cwd: ROOT, stdio: 'ignore' })
   t.after(() => child.kill('SIGKILL'))
@@ -103,7 +118,7 @@ test('a picked sentence carries the turn it was said in into the library', async
   assert.strictEqual(second.dsh_turn, 7, '同一个消息里已经有轮次了，新句子沿用')
 })
 
-test('a box of sentences becomes one card each, or one card holding them all', async (t) => {
+test('a box of sentences becomes one card (the route can still make one each)', async (t) => {
   const env = await boot(t)
   if (!env) return t.skip(`起不来知识库服务（${PY} -m km）`)
 
