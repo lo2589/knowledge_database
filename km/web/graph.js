@@ -170,14 +170,11 @@
     const n = S.hitList.length;
     if (!n) {
       const q = $("search").value.trim();
-      return say(q ? `「${q}」没有匹配的卡片，换个词试试` : "先在顶上那个搜索框里打一个词，再按回车跳下一个");
+      return say(q ? `「${q}」没有命中。搜的是：卡片标题、正文、原文、核对依据，以及导入资料里的句子`
+                   : "先在顶上那个搜索框里打一个词，再按回车跳下一个");
     }
     S.hitIndex = (S.hitIndex + step + n) % n;
-    const id = S.hitList[S.hitIndex];
-    reveal(id);
-    render();
-    center(id);
-    flash(id);
+    showHit(S.hitList[S.hitIndex]);
     showHitCount();
   }
 
@@ -1242,27 +1239,60 @@
   }
 
   let searchT;
-  // What matches right now, in tree order, so "next" walks the graph the way it
-  // is drawn. This never moves the canvas; whoever jumps does that.
+  // Searching the library means searching everything you kept, not only the two
+  // fields a card draws: what you wrote, the sentence it came from, the note you
+  // left while checking it, and the sentences of an imported document that are
+  // still waiting in the lane. Case, full-width and extra spaces never matter —
+  // NFKC folds ｆｕｌｌ－ｗｉｄｔｈ into plain letters and lowercase folds the rest.
+  const norm = text => String(text == null ? "" : text).normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
+  function cardHay(n) {
+    return norm([n.title, n.body, n.check_note, ...(n.origins || []).map(o => o.text)].join("\n"));
+  }
+  // What matches right now, in reading order: cards down the tree, then the
+  // sentences of the imported documents on the left.
   function refreshHits() {
-    const q = $("search").value.trim().toLowerCase();
+    const q = norm($("search").value);
     S.hitQuery = q;
-    const ordered = [];
-    (function walk(id) {
-      const n = node(id);
-      if ((n.title + "\n" + n.body).toLowerCase().includes(q)) ordered.push(id);
-      n.children.forEach(walk);
-    })(S.data.root);
-    S.hitList = q ? ordered : [];
-    S.hits = new Set(S.hitList);
-    S.hitIndex = S.hitList.length ? 0 : -1;
+    const terms = q.split(" ").filter(Boolean);
+    const hits = [];
+    if (terms.length) {
+      (function walk(id) {
+        const n = node(id);
+        const hay = cardHay(n);
+        if (terms.every(t => hay.includes(t))) hits.push({ kind: "card", id });
+        n.children.forEach(walk);
+      })(S.data.root);
+      S.data.sources.forEach(s => (S.units.get(s.id) || []).forEach(u => {
+        if (u.kind === "heading" || u.kind.endsWith("_legacy")) return;
+        if (terms.every(t => norm(u.text).includes(t))) hits.push({ kind: "unit", sid: s.id, uid: u.id, text: u.text });
+      }));
+    }
+    S.hitList = hits;
+    S.hits = new Set(hits.filter(h => h.kind === "card").map(h => h.id));
+    S.hitIndex = hits.length ? 0 : -1;
     showHitCount();
+  }
+  // One hit on screen: a card comes to the middle of the board, a sentence of an
+  // imported document comes to the middle of the lane — and flashes either way.
+  function showHit(hit) {
+    if (!hit) return;
+    if (hit.kind === "card") {
+      reveal(hit.id);
+      render();
+      center(hit.id);
+      flash(hit.id);
+      return;
+    }
+    render();
+    const el = $("layer").querySelector(`[data-unit="${hit.uid}"], [data-legacy="${hit.uid}"]`);
+    if (!el) return say("这段资料已经删掉了");
+    centerEl(el);
+    el.classList.remove("flash"); void el.offsetWidth; el.classList.add("flash");
   }
   function runSearch() {
     refreshHits();
-    if (S.hitIndex >= 0) reveal(S.hitList[0]);
-    render();
-    if (S.hitIndex >= 0) { center(S.hitList[0]); flash(S.hitList[0]); }
+    if (S.hitIndex >= 0) showHit(S.hitList[0]);
+    else render();
   }
   $("search").oninput = () => { clearTimeout(searchT); searchT = setTimeout(runSearch, 200); saveStateSoon(); };
   // Typing is debounced; jumping must not be. Anything that jumps first makes the
@@ -1270,8 +1300,7 @@
   // after typing reads the previous, empty result and claims there is nothing.
   function ensureHits() {
     clearTimeout(searchT);
-    const q = $("search").value.trim().toLowerCase();
-    if (q === S.hitQuery) return false;
+    if (norm($("search").value) === S.hitQuery) return false;
     runSearch();
     return true;
   }
@@ -1279,9 +1308,10 @@
     const fresh = ensureHits();
     if (!S.hitList.length) {
       const q = $("search").value.trim();
-      return say(q ? `「${q}」没有匹配的卡片，换个词试试` : "先在顶上那个搜索框里打一个词，再按回车跳下一个");
+      return say(q ? `「${q}」没有命中。搜的是：卡片标题、正文、原文、核对依据，以及导入资料里的句子`
+                   : "先在顶上那个搜索框里打一个词，再按回车跳下一个");
     }
-    if (!fresh) gotoHit(step);   // a fresh search is already sitting on the first hit
+    if (!fresh) gotoHit(step);
   }
   $("search").onkeydown = e => {
     if (e.key === "Enter") { e.preventDefault(); return void stepHits(e.shiftKey ? -1 : 1); }
