@@ -77,7 +77,7 @@
       localStorage.setItem(stateKey(), JSON.stringify({
         // The version guards against a layout change handing back a view that
         // was remembered for a different geometry.
-        v: 2, mode: S.mode, view: S.view, needFit: !!S.needFit, selected: S.selected,
+        v: 3, mode: S.mode, view: S.view, needFit: !!S.needFit, selected: S.selected,
         closedChildren: [...S.closedChildren], closedTrees: [...S.closedTrees],
         closedRelations: [...S.closedRelations], originsOpen: [...S.originsOpen],
         outlineClosed: S.outlineClosed, q: $("search") ? $("search").value : "",
@@ -96,14 +96,16 @@
     if (raw && (raw.mode === "map" || raw.mode === "outline")) S.mode = raw.mode;
     S.outlineClosed = raw && raw.outlineClosed !== undefined ? !!raw.outlineClosed : EMBEDDED;
     if (raw && raw.q && $("search")) $("search").value = raw.q;
-    const fresh = raw && raw.v === 2;   // a view from an older layout is not this layout
+    const fresh = raw && raw.v === 3;   // a view from an older framing is not this framing
     S.view = fresh && raw.view && Number.isFinite(raw.view.k) && raw.view.k > 0
       ? { k: raw.view.k, x: raw.view.x || 0, y: raw.view.y || 0 } : null;
-    // No remembered place (or one that had never been laid out): show everything.
-    S.needFit = !S.view || !!(raw && raw.needFit);
+    // No remembered place: aim at the active branch rather than the whole map.
+    S.needFocus = !S.view;
+    S.needFit = false;
   }
   S.view = null;
-  S.needFit = true;
+  S.needFocus = true;
+  S.needFit = false;
   restoreState();
   // Every request names this session, so the server answers from that session's
   // own library; the PDF route hands the same URL to a browser to print.
@@ -154,7 +156,7 @@
     // yanking the canvas to the first one.
     if ($("search").value.trim() && !S.hitList.length) refreshHits();
     render();
-    if (focus && node(focus)) { center(focus); flash(focus); }
+    if (focus && node(focus)) { showNew(focus); }
   }
   // Bring one card into sight: open every ancestor that was folded away.
   function reveal(id) {
@@ -162,6 +164,52 @@
       S.closedChildren.delete(p);
       S.closedTrees.delete(p);
     }
+  }
+
+  // 活跃的那一段占住视野：它按 1:1 显示（缩到能放下它自己为止），别的分支不缩、也不抢
+  // 镜头——展开着的它们就落在视野边上，想看就平移过去，而不是把整张图缩成一小团。
+  function subtreeBox(id) {
+    const box = id => { const el = $("layer").querySelector(`.node[data-id="${id}"]`); return el && {
+      x: el.offsetLeft, y: el.offsetTop, w: el.offsetWidth, h: el.offsetHeight }; };
+    const start = box(id);
+    if (!start) return null;
+    // 上级那一层也算进来：活跃的卡不能孤零零悬在一片空白里
+    const up = node(id).parent;
+    const parentBox = up != null ? box(up) : null;
+    let out = { x: start.x, y: start.y, right: start.x + start.w, bottom: start.y + start.h };
+    if (parentBox) {
+      out.x = Math.min(out.x, parentBox.x); out.y = Math.min(out.y, parentBox.y);
+      out.right = Math.max(out.right, parentBox.x + parentBox.w);
+      out.bottom = Math.max(out.bottom, parentBox.y + parentBox.h);
+    }
+    const folded = i => S.closedChildren.has(i) || S.closedTrees.has(i);
+    const walk = i => {
+      if (folded(i)) return;
+      node(i).children.forEach(c => {
+        const b = box(c);
+        if (b) {
+          out.x = Math.min(out.x, b.x); out.y = Math.min(out.y, b.y);
+          out.right = Math.max(out.right, b.x + b.w); out.bottom = Math.max(out.bottom, b.y + b.h);
+        }
+        walk(c);
+      });
+    };
+    walk(id);
+    return { x: out.x, y: out.y, w: out.right - out.x, h: out.bottom - out.y };
+  }
+
+  function focusActive() {
+    const id = S.data && S.data.target;
+    const spot = id != null ? subtreeBox(id) : null;
+    const st = $("stage");
+    S.needFit = false;
+    S.needFocus = false;
+    if (!spot || !st.clientWidth) return fitAll();
+    const pad = 26;
+    const k = Math.max(MIN_K, Math.min(1, (st.clientWidth - pad * 2) / Math.max(1, spot.w),
+                                        (st.clientHeight - pad * 2) / Math.max(1, spot.h)));
+    S.view = { k, x: pad - spot.x * k, y: pad - spot.y * k };
+    applyView();
   }
 
   // Jump between the hits, the way a text editor's find does: next and previous,
@@ -446,14 +494,19 @@
     wire(layer);
     wireEdges();
     renderOutline();
-    $("target").innerHTML = `新知识挂到：<b>${esc(node(d.target).title)}</b>`;
+    const label = $("target");
+    label.innerHTML = `新知识挂到：<b>${esc(node(d.target).title)}</b>`;
+    label.title = "点这里：把画面带回这一段（活跃的分支）";
+    label.style.cursor = "pointer";
+    label.onclick = () => focusActive();
     emptyHint();
     renderLegend();
     // The canvas keeps the view it had. It is only re-fitted when there is no
     // remembered one, when the tree changed shape too much to stay in sight, or
     // when 自适应 was pressed on purpose.
-    if (S.needFit || !S.view) fitAll();
-    else { applyView(); if (!viewShowsSomething()) fitAll(); }
+    if (S.needFit) fitAll();
+    else if (S.needFocus || !S.view) focusActive();
+    else { applyView(); if (!viewShowsSomething()) focusActive(); }
     applyOutline();
     renderRelationIndex();
     fitMathToCards();
@@ -519,7 +572,11 @@
     layer.style.transform = "none";
     wire(layer);
     renderOutline(); renderRelationIndex();
-    $("target").innerHTML = `新知识挂到：<b>${esc(node(d.target).title)}</b>`;
+    const label = $("target");
+    label.innerHTML = `新知识挂到：<b>${esc(node(d.target).title)}</b>`;
+    label.title = "点这里：把画面带回这一段（活跃的分支）";
+    label.style.cursor = "pointer";
+    label.onclick = () => focusActive();
     emptyHint(); renderLegend(); applyOutline();
   }
   function renderRelationIndex() {
@@ -718,8 +775,13 @@
     on("[data-save]", "click", el => saveBody(+el.dataset.save, layer.querySelector(`[data-editbody="${el.dataset.save}"]`).value));
     on("[data-cancel]", "click", () => { S.editing = null; render(); });
     on("[data-fold-rel]", "click", el => { const id = +el.dataset.foldRel; S.closedRelations.has(id) ? S.closedRelations.delete(id) : S.closedRelations.add(id); saveStateSoon(); render(); });
-    on("[data-fold-child]", "click", el => { const id = +el.dataset.foldChild; S.closedChildren.has(id) ? S.closedChildren.delete(id) : S.closedChildren.add(id); saveStateSoon(); render(); });
-    on("[data-outline-fold]", "click", el => { const id = +el.dataset.outlineFold; S.closedChildren.has(id) ? S.closedChildren.delete(id) : S.closedChildren.add(id); saveStateSoon(); render(); });
+    const toggleFold = id => {
+      S.closedChildren.has(id) ? S.closedChildren.delete(id) : S.closedChildren.add(id);
+      saveStateSoon();
+      render();
+    };
+    on("[data-fold-child]", "click", el => toggleFold(+el.dataset.foldChild));
+    on("[data-outline-fold]", "click", el => toggleFold(+el.dataset.outlineFold));
     on("[data-tochat]", "click", (el, e) => { e.stopPropagation(); sendToChat(+el.dataset.tochat); });
     on("[data-origins]", "click", el => { const id = +el.dataset.origins; S.originsOpen.has(id) ? S.originsOpen.delete(id) : S.originsOpen.add(id); saveStateSoon(); render(); });
     on("[data-add-rel]", "click", el => { const id = +el.dataset.addRel; S.relAdding = S.relAdding === id ? null : id; render(); if (S.relAdding === id) layer.querySelector(`[data-relq="${id}"]`)?.focus({ preventScroll: true }); });
@@ -852,7 +914,7 @@
       S.lastNew = c.id;
     }, unit.kind === "table" ? "整张表做成了一张卡" : unit.kind === "table_row" ? "这一行做成了一张卡"
        : unit.kind === "table_item" ? "这一个数据做成了一张卡" : "挂上了", null);
-    if (ok && S.lastNew) { render(); center(S.lastNew); flash(S.lastNew); }
+    if (ok && S.lastNew) { render(); showNew(S.lastNew); }
   }
 
   // One end is the card whose ＋ was pressed; the other end is the card clicked
@@ -923,6 +985,8 @@
     try {
       await api("POST", "target", { id });
       S.data.target = id;
+      render();
+      keepInView(id);
       const layer = $("layer");
       const was = layer.querySelector(`.node[data-id="${from}"]`);
       const now = layer.querySelector(`.node[data-id="${id}"]`);
@@ -951,7 +1015,7 @@
     S.writing = null;
     S.lastNew = null;
     act(async () => { S.lastNew = (await api("POST", "cards", { title: "", body, units: [], parent: id })).id; }, "子信息挂上了")
-      .then(ok => { if (ok && S.lastNew) { center(S.lastNew); flash(S.lastNew); } });
+      .then(ok => { if (ok && S.lastNew) { showNew(S.lastNew); } });
   }
   function renameInline(el, id) {
     el.contentEditable = "true"; el.textContent = node(id).title; el.focus();
@@ -967,8 +1031,13 @@
   }
   async function setTarget(id) {
     if (S.data.target === id) return;
-    try { await api("POST", "target", { id }); S.data.target = id; render(); say("聊天里点的句子现在挂到「" + node(id).title + "」下", true); }
-    catch (e) { fail(e); }
+    try {
+      await api("POST", "target", { id });
+      S.data.target = id;
+      render();
+      keepInView(id);
+      say("聊天里点的句子现在挂到「" + node(id).title + "」下", true);
+    } catch (e) { fail(e); }
   }
   async function candidates(id, q) {
     const box = $("layer").querySelector(`[data-cands="${id}"]`);
@@ -1107,25 +1176,35 @@
     await reload();
     say(moved.length ? `重排好了，${moved.length} 张手动摆过的卡回到树上` : "排版自适应完成", true);
   }
-  // A card you just acted on must stay on screen: opening its body makes it
-  // wider and re-lays the tree, which can slide it out of view.
+  // A card you just acted on must stay on screen — but only just: the view moves
+  // by the smallest step that brings it inside, never re-centering the picture or
+  // throwing it somewhere else.
   function keepInView(id) {
     const el = $("layer").querySelector(`.node[data-id="${id}"]`), st = $("stage");
-    if (!el) return;
-    const r = el.getBoundingClientRect(), s = st.getBoundingClientRect();
-    const outX = r.left < s.left + 8 || r.left > s.right - 120;
-    const outY = r.top < s.top + 8 || r.top > s.bottom - 60;
-    if (outX || outY) {
-      const k = S.view.k;
-      if (outX) S.view.x = s.width / 2 - (el.offsetLeft + Math.min(el.offsetWidth, s.width - 40) / 2) * k;
-      if (outY) S.view.y = 40 - el.offsetTop * k;
-      applyView();
-    }
+    if (!el || !S.view) return;
+    const s = st.getBoundingClientRect(), k = S.view.k || 1, pad = 12;
+    const left = el.offsetLeft * k + S.view.x, right = left + el.offsetWidth * k;
+    const top = el.offsetTop * k + S.view.y, bottom = top + el.offsetHeight * k;
+    let moved = false;
+    if (left < pad) { S.view.x += pad - left; moved = true; }
+    else if (right > st.clientWidth - pad) { S.view.x -= right - (st.clientWidth - pad); moved = true; }
+    if (top < pad) { S.view.y += pad - top; moved = true; }
+    else if (bottom > st.clientHeight - pad) { S.view.y -= bottom - (st.clientHeight - pad); moved = true; }
+    if (moved) applyView();
   }
+
   // Going to a card never re-scales the picture: if the card is already in sight
   // nothing moves at all (the flash says where it is), and only a card that is
   // actually off screen is brought in.
   function center(id) { centerEl($("layer").querySelector(`.node[data-id="${id}"]`)); }
+  // 刚入图的那张卡：在眼前就只闪一下，画面一动不动；真在屏幕外才挪最小的那一步
+  // 把它带进来，绝不为了它把镜头甩到远处。
+  function showNew(id) {
+    const el = $("layer").querySelector(`.node[data-id="${id}"]`);
+    if (!el) return;
+    keepInView(id);
+    flash(id);
+  }
   function centerEl(el) {
     if (!el) return;
     const st = $("stage"), s = st.getBoundingClientRect(), r = el.getBoundingClientRect();
@@ -1208,7 +1287,7 @@
       const c = await api("POST", "cards", { title, body, units: [], parent });
       S.lastNew = c.id;
     }, "新卡已挂到「" + node(parent).title + "」下面", null);
-    if (ok) { $("quick-title").value = ""; $("quick-body").value = ""; $("quick-cancel").click(); if (S.lastNew) { render(); center(S.lastNew); flash(S.lastNew); } }
+    if (ok) { $("quick-title").value = ""; $("quick-body").value = ""; $("quick-cancel").click(); if (S.lastNew) { render(); showNew(S.lastNew); } }
   }
   $("quick-save").onclick = () => saveQuick(S.data.target);
   $("quick-save-child").onclick = () => {
@@ -1264,7 +1343,7 @@
     const ok = await act(async () => {
       S.lastNew = (await api("POST", "cards", { title: "", body: up.markdown, units: [], parent: S.data.target })).id;
     }, "图片做成了一张新卡，挂在「" + node(S.data.target).title + "」下", null);
-    if (ok && S.lastNew) { center(S.lastNew); flash(S.lastNew); }
+    if (ok && S.lastNew) { showNew(S.lastNew); }
   }
   // 同一个手势在哪儿都能用：编辑框里插到光标处，卡片上追加到这张卡，空白处开新卡。
   async function handleImages(files, target) {
@@ -1490,7 +1569,7 @@
         const ok = await act(async () => {
           S.lastNew = (await api("POST", "cards", { title: "", body: up.markdown, units: [], parent: S.data.target })).id;
         }, "图片做成了一张新卡", null);
-        if (ok && S.lastNew) { center(S.lastNew); flash(S.lastNew); }
+        if (ok && S.lastNew) { showNew(S.lastNew); }
       } catch (err) { fail(err); }
       return;
     }
@@ -1519,7 +1598,7 @@
       restoreState();                      // and the one we open gets its own back
       reload();
     }
-    if (d.type === "focus" && d.card && S.data && node(d.card)) { reveal(d.card); render(); center(d.card); flash(d.card); }
+    if (d.type === "focus" && d.card && S.data && node(d.card)) { reveal(d.card); render(); showNew(d.card); }
   });
   // Clicking [[a link]] inside a card goes to that card.
   document.addEventListener("click", e => {

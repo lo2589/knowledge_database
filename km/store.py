@@ -305,7 +305,10 @@ class KnowledgeStore:
     # --- cards -------------------------------------------------------------
 
     def create_card(self, title: str, body: str, unit_ids: list[int], parent: int | None = None) -> dict:
-        """New card, filed as the last child of `parent` (default: the root)."""
+        """New card, filed under `parent` (default: the root) as close to it as
+        the tree allows: the middle of its children, which is the slot the parent
+        sits right above. Appending to the end instead would drop every new card
+        at the far end of an already wide row, further away with each pick."""
         if not body.strip():
             raise ValueError("卡片内容不能为空")
         with self.lock:
@@ -321,7 +324,8 @@ class KnowledgeStore:
                 self.db.link(cid, "from_unit", uid)
                 self.db.patch(uid, {"attrs": {"status": "kept"}})
             self.db.link(cid, PARENT, parent)
-            self.db.patch(cid, {"attrs": {"pos": len(self._children(parent)) - 1}})
+            siblings = [c["id"] for c in self._children(parent) if c["id"] != cid]
+            self._move(cid, parent, siblings[len(siblings) // 2] if siblings else None)
             self._sync_mentions(cid, body)
             self._resolve_dangling(title)
             return self._card(cid)
