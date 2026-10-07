@@ -49,6 +49,9 @@
     editing: null, writing: null, merging: null, hits: new Set(), units: new Map(), linkQ: {},
     closedRelations: new Set(), closedChildren: new Set(), closedTrees: new Set(), selectedRef: null, relAdding: null,
     selected: null, mergeArmed: null, linkFrom: null, originsOpen: new Set(), hitList: [], hitIndex: -1, hitQuery: null,
+    // 平时只展开「活跃节点 + 它的子节点」这一块：不活跃的子树折起来，兄弟才会挨在一起，
+    // 活跃节点和它的子节点才装得进画面。手动展开过的分支记在这里，自动折叠不再动它。
+    opened: new Set(),
     outlineClosed: EMBEDDED,
     // The graph opens on the hierarchy map itself — the tree drawn top-down is
     // the product surface. The Outliner is one click away on the mode button.
@@ -77,9 +80,9 @@
       localStorage.setItem(stateKey(), JSON.stringify({
         // The version guards against a layout change handing back a view that
         // was remembered for a different geometry.
-        v: 3, mode: S.mode, view: S.view, needFit: !!S.needFit, selected: S.selected,
+        v: 4, mode: S.mode, view: S.view, needFit: !!S.needFit, selected: S.selected,
         closedChildren: [...S.closedChildren], closedTrees: [...S.closedTrees],
-        closedRelations: [...S.closedRelations], originsOpen: [...S.originsOpen],
+        closedRelations: [...S.closedRelations], originsOpen: [...S.originsOpen], opened: [...S.opened],
         outlineClosed: S.outlineClosed, q: $("search") ? $("search").value : "",
       }));
     } catch (e) { /* a full or blocked store must never break the board */ }
@@ -92,11 +95,12 @@
     S.closedTrees = numSet(raw && raw.closedTrees);
     S.closedRelations = numSet(raw && raw.closedRelations);
     S.originsOpen = numSet(raw && raw.originsOpen);
+    S.opened = numSet(raw && raw.opened);
     S.selected = raw && Number.isFinite(raw.selected) ? raw.selected : null;
     if (raw && (raw.mode === "map" || raw.mode === "outline")) S.mode = raw.mode;
     S.outlineClosed = raw && raw.outlineClosed !== undefined ? !!raw.outlineClosed : EMBEDDED;
     if (raw && raw.q && $("search")) $("search").value = raw.q;
-    const fresh = raw && raw.v === 3;   // a view from an older framing is not this framing
+    const fresh = raw && raw.v === 4;   // a view from an older framing is not this framing
     S.view = fresh && raw.view && Number.isFinite(raw.view.k) && raw.view.k > 0
       ? { k: raw.view.k, x: raw.view.x || 0, y: raw.view.y || 0 } : null;
     // No remembered place: aim at the active branch rather than the whole map.
@@ -155,6 +159,7 @@
     // A remembered search is still a search: the hits come back marked, without
     // yanking the canvas to the first one.
     if ($("search").value.trim() && !S.hitList.length) refreshHits();
+    if (!S.foldedOnce) { S.foldedOnce = true; foldToActive(); }
     render();
     if (focus && node(focus)) { showNew(focus); }
   }
@@ -204,12 +209,29 @@
     });
   }
 
-  // 以某张卡为中心填满画面：先算它（和它上面一层），不够多就把最近的卡一张张拉进来，
-  // 直到画面被内容占住。远处的分支永远不进画面——所以既不会"地广行稀"，也不会让别的
-  // 分支把活跃的那段挤没了。
+  // 平时把不活跃的子树折起来：不折的话，一个兄弟的子树就能把兄弟之间撑开几千像素，
+  // 「活跃节点 + 它的子节点都在画面里」就永远做不到。折的只是画法，你自己展开过的分支
+  // （S.opened）一律不动。
+  // @returns 是否改动了折叠状态。
+  function foldToActive() {
+    if (!S.data) return false;
+    const path = new Set();
+    for (let p = S.data.target; p != null; p = node(p).parent) path.add(p);
+    let changed = false;
+    Object.values(S.data.nodes).forEach(n => {
+      if (!n.children.length) return;
+      const keepOpen = path.has(n.id) || S.opened.has(n.id);
+      const was = S.closedChildren.has(n.id);
+      if (!keepOpen && !was) { S.closedChildren.add(n.id); changed = true; }
+    });
+    return changed;
+  }
+
+  // 取景：活跃的那张卡和它的**全部子节点**必须都在画面里（这是硬要求），然后为了不让
+  // 画面空着，再把最近的卡一张张拉进来——但绝不为此把画面缩到读不清。
   function focusOn(id) {
     const st = $("stage"), layer = $("layer");
-    const seed = $("layer").querySelector(`.node[data-id="${id}"]`);
+    const seed = layer.querySelector(`.node[data-id="${id}"]`);
     const els = [...layer.querySelectorAll(".node, .source")];
     if (!seed || !els.length || !st.clientWidth) return fitAll();
     const pad = 26, W = Math.max(1, st.clientWidth - pad * 2), H = Math.max(1, st.clientHeight - pad * 2);
@@ -217,30 +239,72 @@
     const union = (a, b) => ({ x: Math.min(a.x, b.x), y: Math.min(a.y, b.y),
                                w: Math.max(a.x + a.w, b.x + b.w) - Math.min(a.x, b.x),
                                h: Math.max(a.y + a.h, b.y + b.h) - Math.min(a.y, b.y) });
-    const measure = box => {
-      const k = Math.max(MIN_K, Math.min(1, W / Math.max(1, box.w), H / Math.max(1, box.h)));
-      return { k, fill: (Math.min(W, box.w * k) / W) * (Math.min(H, box.h * k) / H) };
-    };
+    const fitK = box => Math.min(1, W / Math.max(1, box.w), H / Math.max(1, box.h));
+    const fillOf = (box, k) => (Math.min(W, box.w * k) / W) * (Math.min(H, box.h * k) / H);
+
     const start = rectOf(seed);
-    const up = node(id).parent;
-    let box = up != null ? union(start, rectOf($("layer").querySelector(`.node[data-id="${up}"]`)))
-                         : { x: start.x, y: start.y, w: start.w, h: start.h };
+    // ① 活跃的卡 + 它展开着的子节点：尽量一个都不能少
+    const n = node(id);
+    let box = { x: start.x, y: start.y, w: start.w, h: start.h };
+    const kidsEls = n.children.map(c => layer.querySelector(`.node[data-id="${c}"]`)).filter(Boolean);
+    // 树上的孩子先全进来；被手动摆到很远的孩子，只有当"拉进来还看得清"时才进
+    const onTree = kidsEls.filter(el => S.data.nodes[+el.dataset.id].x == null && S.data.nodes[+el.dataset.id].y == null);
+    const pinned = kidsEls.filter(el => !onTree.includes(el));
+    onTree.forEach(el => { box = union(box, rectOf(el)); });
+    // 叶子卡就把它上面一层带上，别让它孤零零悬在空白里
+    if (!kidsEls.length && n.parent != null) box = union(box, rectOf(layer.querySelector(`.node[data-id="${n.parent}"]`)));
+    // 装下这一块要求的尺度可以低于平时的可读下限——"孩子必须看得见"优先
+    const FLOOR = 0.32;
+    let k = Math.max(FLOOR, fitK(box));
+    for (const el of pinned) {
+      const grown = union(box, rectOf(el));
+      const kk = Math.max(FLOOR, fitK(grown));
+      if (kk < MIN_K) break;              // 拉进来就要缩得看不清，那就不拉：另有提示
+      box = grown; k = kk;
+    }
+
+    // ② 画面还空，就一张张加最近的卡；但为此缩放不许低于 MIN_K（宁可留白，不缩小到读不清）
     const cx = start.x + start.w / 2, cy = start.y + start.h / 2;
-    const others = els.map(rectOf).filter(r => r.x !== start.x || r.y !== start.y)
+    const others = els.filter(el => el !== seed).map(rectOf)
       .sort((a, b) => Math.hypot(a.x + a.w / 2 - cx, a.y + a.h / 2 - cy) - Math.hypot(b.x + b.w / 2 - cx, b.y + b.h / 2 - cy));
-    let m = measure(box);
     for (const r of others) {
-      if (m.fill >= 0.45) break;         // 画面已经被内容占住了，够了
-      box = union(box, r);
-      m = measure(box);
+      if (fillOf(box, k) >= 0.45) break;
+      const grown = union(box, r);
+      const kk = Math.max(FLOOR, fitK(grown));
+      if (kk < MIN_K) break;                 // 再加上去就要缩得看不清了，停
+      box = grown; k = kk;
     }
     S.needFit = false;
     S.needFocus = false;
-    S.view = { k: m.k, x: pad - box.x * m.k, y: pad - box.y * m.k };
+    S.view = { k, x: pad - box.x * k, y: pad - box.y * k };
     applyView();
   }
 
-  function focusActive() { focusOn(S.data && S.data.target); }
+  function focusActive() {
+    focusOn(S.data && S.data.target);
+    paintTarget();
+  }
+
+  // 活跃节点的子节点要是被手动摆到画面外，光说"在视野内"是做不到的：直接告诉人，
+  // 并且告诉他按哪个按钮能把它们收回树上（自适应会清掉手动摆放）。
+  function paintTarget() {
+    const label = $("target");
+    const id = S.data && S.data.target;
+    if (!label || id == null || !node(id)) return;
+    const st = $("stage").getBoundingClientRect();
+    const stray = node(id).children.filter(c => {
+      const el = $("layer").querySelector(`.node[data-id="${c}"]`);
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.right < st.left - 4 || r.left > st.right + 4 || r.bottom < st.top - 4 || r.top > st.bottom + 4;
+    });
+    label.innerHTML = `新知识挂到：<b>${esc(node(id).title)}</b>` + (stray.length
+      ? ` <span class="stray" title="它们被手动摆到了很远的地方。点「自适应」会把摆过的卡片收回树上，然后就看得到了">⚠ ${stray.length} 个子节点在画面外</span>`
+      : "");
+    label.title = "点这里：把画面带回这一段（活跃的分支）";
+    label.style.cursor = "pointer";
+    label.onclick = () => focusActive();
+  }
 
   // 一张卡要看得到，而且画面不能因此变空：先最小位移把它带进来；画面还是大面积为空，
   // 就以它为中心重新填满。
@@ -543,11 +607,7 @@
     wire(layer);
     wireEdges();
     renderOutline();
-    const label = $("target");
-    label.innerHTML = `新知识挂到：<b>${esc(node(d.target).title)}</b>`;
-    label.title = "点这里：把画面带回这一段（活跃的分支）";
-    label.style.cursor = "pointer";
-    label.onclick = () => focusActive();
+    paintTarget();
     emptyHint();
     renderLegend();
     // The canvas keeps the view it had. It is only re-fitted when there is no
@@ -556,6 +616,7 @@
     if (S.needFit) fitAll();
     else if (S.needFocus || !S.view) focusActive();
     else { applyView(); if (contentFill() < 0.25 && offscreenContent()) focusActive(); }
+    paintTarget();          // 取景之后再写这行：它要报告"有几个子节点在画面外"
     applyOutline();
     renderRelationIndex();
     fitMathToCards();
@@ -595,11 +656,7 @@
     layer.style.transform = "none";
     wire(layer);
     renderOutline(); renderRelationIndex();
-    const label = $("target");
-    label.innerHTML = `新知识挂到：<b>${esc(node(d.target).title)}</b>`;
-    label.title = "点这里：把画面带回这一段（活跃的分支）";
-    label.style.cursor = "pointer";
-    label.onclick = () => focusActive();
+    paintTarget();
     emptyHint(); renderLegend(); applyOutline();
   }
 
@@ -1023,8 +1080,9 @@
     try {
       await api("POST", "target", { id });
       S.data.target = id;
+      foldToActive();
       render();
-      keepInView(id);
+      focusActive();
       const layer = $("layer");
       const was = layer.querySelector(`.node[data-id="${from}"]`);
       const now = layer.querySelector(`.node[data-id="${id}"]`);
@@ -1072,8 +1130,9 @@
     try {
       await api("POST", "target", { id });
       S.data.target = id;
+      foldToActive();
       render();
-      keepInView(id);
+      focusActive();
       say("聊天里点的句子现在挂到「" + node(id).title + "」下", true);
     } catch (e) { fail(e); }
   }
