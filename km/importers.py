@@ -300,11 +300,12 @@ def docx_markdown(data: bytes) -> str:
     return "\n\n".join(out)
 
 
-def _md_table(rows: list[list[str]]) -> str:
+def _md_table(rows: list[list[str]], *, has_header: bool = True) -> str:
     width = max(len(r) for r in rows)
     rows = [r + [""] * (width - len(r)) for r in rows]
-    lines = ["| " + " | ".join(rows[0]) + " |", "|" + "---|" * width]
-    lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    headers = rows[0] if has_header else [f"列{i + 1}" for i in range(width)]
+    lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * width]
+    lines += ["| " + " | ".join(r) + " |" for r in (rows[1:] if has_header else rows)]
     return "\n".join(lines)
 
 
@@ -335,6 +336,7 @@ class _H2M(HTMLParser):
         self.lists: list[list] = []  # [kind, counter]
         self.href: list[str | None] = []
         self.table: list[list[str]] | None = None
+        self.table_has_header = False
         self.cell: list[str] | None = None
         self.math: dict | None = None  # collecting TeX
         self.math_depth = 0
@@ -414,9 +416,12 @@ class _H2M(HTMLParser):
             self.w("\n\n> ")
         elif tag == "table":
             self.table = []
+            self.table_has_header = False
         elif tag == "tr" and self.table is not None:
             self.table.append([])
         elif tag in ("td", "th") and self.table is not None:
+            if tag == "th" and len(self.table) == 1:
+                self.table_has_header = True
             self.cell = []
 
     def handle_endtag(self, tag):
@@ -462,7 +467,7 @@ class _H2M(HTMLParser):
             rows = [r for r in self.table if r]
             self.table = None
             if rows:
-                self.out.append("\n\n" + _md_table(rows) + "\n\n")
+                self.out.append("\n\n" + _md_table(rows, has_header=self.table_has_header) + "\n\n")
 
     def handle_data(self, data):
         if self.math is not None:

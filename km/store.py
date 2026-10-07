@@ -13,6 +13,7 @@ the ones the UI offers, each read as "A <relation> B".
 
 from __future__ import annotations
 
+import json
 import re
 import threading
 import time
@@ -20,7 +21,7 @@ import time
 import fastnode
 
 from .importers import Document
-from .split import split_markdown
+from .split import LABELLED_ITEM, split_markdown, split_sentences
 
 RELATIONS = {
     "belongs_to": "属于",      # A 属于 B：B 是 A 的上一级。每张卡最多一个上级，组成层级树
@@ -89,6 +90,40 @@ class KnowledgeStore:
         with self.lock:
             self.root = self._ensure_root(root_title)
             self._adopt_orphans()
+            self._migrate_structured_units()
+
+    def _migrate_structured_units(self) -> None:
+        """Split old tables and inline records, preserving existing card origins."""
+        for kind in ("table", "sentence"):
+            old = self.db.query({"predicate": {"op": "and", "args": [
+                {"op": "eq", "field": "@type", "value": "unit"},
+                {"op": "eq", "field": "/kind", "value": kind}]},
+                "include_data": True, "limit": 100000})["nodes"]
+            for unit in old:
+                self._migrate_structured_unit(unit, kind)
+
+    def _migrate_structured_unit(self, unit: dict, kind: str) -> None:
+        attrs = unit["attrs"]
+        if kind == "table":
+            pieces = [p for p in split_markdown(attrs["text"]) if p.kind == "table_item"]
+        else:
+            sentences = split_sentences(attrs["text"])
+            if sum(bool(LABELLED_ITEM.match(s)) for s in sentences) < 2:
+                return
+            pieces = [p for p in split_markdown(attrs["text"]) if p.kind == "sentence"]
+        if not pieces:
+            return
+        linked = any(l["relation"] == "from_unit" for l in self._links(unit["id"])["in"])
+        for index, piece in enumerate(pieces, 1):
+            order = attrs["order"] + index / (len(pieces) + 1)
+            uid = self.db.create({"type": "unit", "summary": plain(piece.text),
+                                  "attrs": {**attrs, "order": order, "kind": piece.kind,
+                                            "text": piece.text, "status": "new"}})
+            self.db.link(uid, "in_source", attrs["source"])
+        if linked:
+            self.db.patch(unit["id"], {"attrs": {"kind": kind + "_legacy", "status": "kept"}})
+        else:
+            self.db.delete(unit["id"])
 
     # --- sources and units -------------------------------------------------
 
@@ -131,20 +166,44 @@ class KnowledgeStore:
             out = []
             for n in res["nodes"]:
                 counts = {}
+                legacy = sum(self.db.query({"predicate": {"op": "and", "args": [
+                    {"op": "eq", "field": "/source", "value": n["id"]},
+                    {"op": "eq", "field": "/kind", "value": kind + "_legacy"}]},
+                    "limit": 0})["total"] for kind in ("table", "sentence"))
                 for st in STATUSES:
                     counts[st] = self.db.query({"predicate": {"op": "and", "args": [
                         {"op": "eq", "field": "/source", "value": n["id"]},
                         {"op": "eq", "field": "/status", "value": st}]}, "limit": 0})["total"]
+                counts["kept"] -= legacy
                 out.append({"id": n["id"], **n["attrs"], "counts": counts})
             return out
 
-    def delete_source(self, sid: int) -> None:
+    def delete_source(self, sid: int) -> dict:
+        """Delete an imported source, its sentences and the cards made from them.
+
+        A card exists because a sentence was kept; with the source gone that card
+        has no origin left to point at, so it goes with it. The cards' children
+        rise to their parents, the same rule an ordinary card deletion follows.
+        @param sid - the source record id.
+        @returns how many sentences and cards went with it.
+        @throws KeyError when there is no such record.
+        """
+        self._need(sid, "source")
         with self.lock:
-            ids = self.db.query({"predicate": {"op": "eq", "field": "/source", "value": sid},
-                                 "limit": 100000})["ids"]
-            for uid in ids:
+            units = self.db.query({"predicate": {"op": "eq", "field": "/source", "value": sid},
+                                   "limit": 100000})["ids"]
+            cards = []
+            for uid in units:
+                for link in self._links(uid)["in"]:
+                    if link["relation"] == "from_unit" and link["id"] != self.root and link["id"] not in cards:
+                        cards.append(link["id"])
+        for cid in cards:
+            self.delete_card(cid)
+        with self.lock:
+            for uid in units:
                 self.db.delete(uid)
             self.db.delete(sid)
+        return {"units": len(units), "cards": len(cards)}
 
     def units(self, sid: int) -> list[dict]:
         with self.lock:
@@ -257,6 +316,58 @@ class KnowledgeStore:
             for i, x in enumerate(order):
                 self.db.patch(x, {"attrs": {"pos": i}})
 
+    def merge_cards(self, target: int, source: int) -> dict:
+        """Fold a card into another while retaining content, origins and links."""
+        if target == source:
+            raise ValueError("不能把卡片合并到自己")
+        with self.lock:
+            keep, absorb = self._need(target, "card"), self._need(source, "card")
+            if source == self.root or target == self.root:
+                raise ValueError("知识库根节点不能参与合并")
+            parent = self._parent_of(source)
+            # A descendant can become the survivor: lift it out first.
+            p = self._parent_of(target)
+            while p is not None:
+                if p == source:
+                    self._move(target, parent)
+                    break
+                p = self._parent_of(p)
+            for child in [c["id"] for c in self._children(source)]:
+                if child != target:
+                    self._move(child, target)
+            links = self._links(source)
+            for link in links["out"]:
+                if link["relation"] == "from_unit":
+                    self.db.link(target, "from_unit", link["id"])
+                elif link["relation"] in RELATIONS and link["relation"] != PARENT and link["id"] != target:
+                    if not any(l["relation"] == link["relation"] and l["id"] == link["id"]
+                               for l in self._links(target)["out"]):
+                        self.db.link(target, link["relation"], link["id"])
+            for link in links["in"]:
+                if link["relation"] in RELATIONS and link["relation"] != PARENT and link["id"] != target:
+                    if not any(l["relation"] == link["relation"] and l["id"] == target
+                               for l in self._links(link["id"])["out"]):
+                        self.db.link(link["id"], link["relation"], target)
+            a, b = keep["attrs"], absorb["attrs"]
+            body = a["body"] if b["body"].strip() in a["body"] else a["body"].rstrip() + "\n\n" + b["body"].strip()
+            note = "\n".join(dict.fromkeys(x for x in (a.get("check_note", ""), b.get("check_note", "")) if x))
+            check = a.get("check", "unchecked")
+            if check == "unchecked":
+                check = b.get("check", "unchecked")
+            self.db.patch(target, {"attrs": {"body": body, "updated": now_ms(), "check": check, "check_note": note}})
+            mention_sources = [l["id"] for l in links["in"] if l["relation"] == MENTIONS and l["id"] != target]
+            self._rename_references(source, b["title"], a["title"])
+            self.db.delete(source)
+            if parent is not None:
+                for i, child in enumerate(self._children(parent)):
+                    self.db.patch(child["id"], {"attrs": {"pos": i}})
+            self._sync_mentions(target, self.db.get(target, links="none")["attrs"]["body"])
+            for other in mention_sources:
+                n = self.db.get(other, links="none")
+                if n:
+                    self._sync_mentions(other, n["attrs"]["body"])
+            return self._card(target)
+
     def card(self, cid: int) -> dict:
         with self.lock:
             self._need(cid, "card")
@@ -289,7 +400,7 @@ class KnowledgeStore:
             self._need(b, "card")
             if relation == PARENT:
                 self._move(a, b)
-            else:
+            elif not any(l["relation"] == relation and l["id"] == b for l in self._links(a)["out"]):
                 self.db.link(a, relation, b)
             return self._card(a)
 
@@ -399,6 +510,125 @@ class KnowledgeStore:
         return [{"id": self.root, "title": r["title"], "check": r.get("check", "unchecked"),
                  "root": True, "children": build(self.root)}]
 
+    def mermaid(self, with_body: bool = False) -> str:
+        """The whole library as one Mermaid flowchart: the strict tree top-down,
+        plus every extra relation as a labelled dashed line.
+
+        Card titles become the node labels; when a card has no title its first
+        line of body is used. A card whose check is not "unchecked" keeps that in
+        the diagram, so a reader sees what was verified.
+        @param with_body - also put the card's own words in the label, for a
+            diagram that carries the knowledge instead of only its shape.
+        @returns Mermaid source, newline-terminated.
+        """
+        # canvas() takes the lock itself: read it outside, never inside.
+        data = self.canvas()
+        nodes, refs = data["nodes"], data["refs"]
+
+        def label(n: dict) -> str:
+            title = (n.get("title") or "").strip() or (n.get("body") or "").strip().splitlines()[0][:60]
+            text = title
+            body = (n.get("body") or "").strip()
+            if with_body and body and body != title:
+                text = title + "\n" + (body[:600] + ("…" if len(body) > 600 else ""))
+            for bad, good in (("&", "&amp;"), ('"', "#quot;"), ("<", "&lt;"), (">", "&gt;")):
+                text = text.replace(bad, good)
+            return '"' + text.replace("\n", "<br/>") + '"'
+
+        name = lambda cid: "n%d" % cid
+        lines = ["graph TD"]
+        checked = []
+        for cid in sorted(nodes, key=lambda c: (nodes[c]["level"], nodes[c]["order"])):
+            n = nodes[cid]
+            lines.append(f"  {name(cid)}[{label(n)}]")
+            if n.get("check") and n["check"] != "unchecked":
+                checked.append((name(cid), n["check"]))
+        for cid in nodes:
+            parent = nodes[cid]["parent"]
+            if parent is not None and parent in nodes:
+                lines.append(f"  {name(parent)} --> {name(cid)}")
+        for r in refs:
+            lines.append(f"  {name(r['from'])} -.->|{RELATIONS.get(r['relation'], r['relation'])}| {name(r['to'])}")
+        if checked:
+            colors = {"ok": "#4f7f66", "fixed": "#4f6f9f", "doubt": "#b08a3e", "wrong": "#a4574d"}
+            for level, color in colors.items():
+                ids = [i for i, c in checked if c == level]
+                if ids:
+                    lines.append(f"  classDef {level} stroke:{color},stroke-width:3px;")
+                    lines.append(f"  class {','.join(ids)} {level};")
+        return "\n".join(lines) + "\n"
+
+    def markdown(self) -> str:
+        """The library as one Markdown document, in reading order.
+
+        The tree becomes the heading structure, so an editor's own outline is
+        this knowledge tree. Under each card: what it says, the sentences it came
+        from as quotes with their source, the relations that point at it or leave
+        it, and the check verdict when there is one.
+        @returns Markdown, newline-terminated.
+        """
+        data = self.canvas()
+        nodes, root = data["nodes"], data["root"]
+        cards = [n for n in nodes.values() if not n["root"]]
+
+        def heading(depth: int, text: str) -> str:
+            return "#" * max(1, min(6, depth)) + " " + text.strip()
+
+        def quote(text: str) -> list[str]:
+            return [("> " + line).rstrip() for line in str(text).strip().splitlines() or [""]]
+
+        out = [heading(1, nodes[root]["title"]), ""]
+        out.append(f"> {len(cards)} 张卡 · {len(data['refs'])} 条关系 · "
+                   f"{sum(1 for c in cards if c['origins'])} 张有原文")
+        out.append("")
+
+        def emit(cid: int, depth: int, path: str) -> None:
+            n = nodes[cid]
+            if cid != root:
+                out.append(heading(depth, f"{path} {n['title']}".strip()))
+                out.append("")
+                if n["body"].strip():
+                    out.extend([n["body"].strip(), ""])
+                for o in n["origins"]:
+                    out.append(f"**原文**（{o['source_title']}）：")
+                    out.extend(quote(o["text"]))
+                    out.append("")
+                lines = []
+                for l in n["out"]:
+                    if l["relation"] != PARENT:
+                        lines.append(f"- {RELATIONS.get(l['relation'], l['relation'])} → {l['title']}")
+                for l in n["in"]:
+                    if l["relation"] != PARENT:
+                        lines.append(f"- {l['title']} → 本卡（{RELATIONS.get(l['relation'], l['relation'])}）")
+                if n["check"] != "unchecked":
+                    note = f"（{n['check_note']}）" if n.get("check_note") else ""
+                    lines.append(f"- 核对：{CHECKS.get(n['check'], n['check'])}{note}")
+                if lines:
+                    out.extend(lines + [""])
+            for i, child in enumerate(sorted(n["children"], key=lambda c: nodes[c]["order"]), 1):
+                emit(child, depth + 1, (path + "." if path else "") + str(i))
+
+        emit(root, 1, "")
+        return "\n".join(out).rstrip() + "\n"
+
+    def export(self, fmt: str) -> dict:
+        """One export in the format asked for, ready to be written as a file.
+
+        @param fmt - mermaid, mermaid-full, markdown or json.
+        @returns the text plus the file extension and media type it wants.
+        @throws ValueError when the format is not one of those.
+        """
+        if fmt in ("mermaid", "mermaid-full"):
+            return {"format": fmt, "ext": ".mmd", "mime": "text/plain; charset=utf-8",
+                    "text": self.mermaid(with_body=fmt == "mermaid-full")}
+        if fmt == "markdown":
+            return {"format": fmt, "ext": ".md", "mime": "text/markdown; charset=utf-8",
+                    "text": self.markdown()}
+        if fmt == "json":
+            return {"format": fmt, "ext": ".json", "mime": "application/json; charset=utf-8",
+                    "text": json.dumps(self.structure(), ensure_ascii=False, indent=2) + "\n"}
+        raise ValueError("导出格式只能是 mermaid / mermaid-full / markdown / json")
+
     def structure(self) -> dict:
         """The tree in the strict form (single root; parent, level, order and
         path for every card) plus the non-tree relations, as knowledge-tree
@@ -462,15 +692,27 @@ class KnowledgeStore:
         if new_relation not in RELATIONS:
             raise ValueError(f"关系只能是 {list(RELATIONS)}")
         with self.lock:
+            self._need(a, "card")
+            self._need(b, "card")
             if not any(l["relation"] == relation and l["id"] == b for l in self._links(a)["out"]):
                 raise KeyError("这条关系不存在")
+            if relation == new_relation:
+                return self._card(a)
+            if new_relation == PARENT:
+                if a == self.root:
+                    raise ValueError("根节点不能挂到别处")
+                up = b
+                while up is not None:
+                    if up == a:
+                        raise ValueError("不能挂到它自己的下级下面，会转圈")
+                    up = self._parent_of(up)
             if relation == PARENT:
                 self._move(a, self.root)  # the old parent link becomes something else
             else:
                 self.db.unlink(a, relation, b)
             if new_relation == PARENT:
                 self._move(a, b)
-            else:
+            elif not any(l["relation"] == new_relation and l["id"] == b for l in self._links(a)["out"]):
                 self.db.link(a, new_relation, b)
             return self._card(a)
 
@@ -498,7 +740,10 @@ class KnowledgeStore:
     def stats(self) -> dict:
         with self.lock:
             count = lambda t: self.db.query({"predicate": {"op": "eq", "field": "@type", "value": t}, "limit": 0})["total"]
-            return {"sources": count("source"), "units": count("unit"), "cards": count("card")}
+            legacy = sum(self.db.query({"predicate": {"op": "eq", "field": "/kind",
+                                                  "value": kind + "_legacy"},
+                                        "limit": 0})["total"] for kind in ("table", "sentence"))
+            return {"sources": count("source"), "units": count("unit") - legacy, "cards": count("card")}
 
     # --- internals ---------------------------------------------------------
 
@@ -537,7 +782,8 @@ class KnowledgeStore:
                 origins.append({"unit": u["id"], "text": u["attrs"]["text"], "source": u["attrs"]["source"],
                                 "index": u["attrs"].get("order", 0),
                                 "source_title": sa.get("title", "（资料已删除）"),
-                                "dsh_session": sa.get("dsh_session"), "dsh_message": sa.get("dsh_message")})
+                                "dsh_session": sa.get("dsh_session"), "dsh_message": sa.get("dsh_message"),
+                                "dsh_turn": sa.get("dsh_turn")})
         return {"id": cid, "title": a["title"], "body": a["body"], "created": a["created"],
                 "updated": a["updated"], "out": out_links, "in": in_links, "origins": origins,
                 "mentions_out": mentions_out, "mentions_in": mentions_in, "refs": refs,
@@ -574,27 +820,32 @@ class KnowledgeStore:
             hit = self.db.query({"predicate": {"op": "and", "args": [
                 {"op": "eq", "field": "@type", "value": "source"},
                 {"op": "eq", "field": "/dsh_message", "value": msg}]}, "limit": 1})["ids"]
+            turn = origin.get("turn")
             if hit:
                 sid = hit[0]
+                if turn is not None:
+                    self.db.patch(sid, {"attrs": {"dsh_turn": int(turn)}})
             else:
                 q = (origin.get("question") or "对话").replace("\n", " ").strip()
                 sid = self.db.create({"type": "source", "summary": plain(q, 120),
                                       "attrs": {"title": q[:80], "format": "dsh", "created": now_ms(),
-                                                "dsh_session": sess, "dsh_message": msg, "cwd": origin.get("cwd", "")}})
+                                                "dsh_session": sess, "dsh_message": msg, "cwd": origin.get("cwd", ""),
+                                                "dsh_turn": None if turn is None else int(turn)}})
             unit = self.db.query({"predicate": {"op": "and", "args": [
                 {"op": "eq", "field": "/source", "value": sid},
-                {"op": "eq", "field": "/order", "value": idx}]}, "limit": 1})["ids"]
+                {"op": "eq", "field": "/text", "value": text}]}, "limit": 1})["ids"]
             if unit:
                 uid = unit[0]
             else:
                 uid = self.db.create({"type": "unit", "summary": plain(text),
-                                      "attrs": {"source": sid, "order": idx, "message": 0, "speaker": "assistant",
+                                      "attrs": {"source": sid, "order": idx, "message": 0,
+                                                "speaker": "user" if origin.get("speaker") == "user" else "assistant",
                                                 "kind": "sentence", "text": text, "section": "", "status": "kept"}})
                 self.db.link(uid, "in_source", sid)
         return self.create_card(title, text, [uid], parent)
 
     def picked(self, message: str) -> dict:
-        """Which sentences of one chat message are already cards: {index: [card ids]}."""
+        """Cards keyed by exact source text, stable when split positions change."""
         with self.lock:
             hit = self.db.query({"predicate": {"op": "and", "args": [
                 {"op": "eq", "field": "@type", "value": "source"},
@@ -606,7 +857,7 @@ class KnowledgeStore:
                                     "include_data": True, "limit": 100000})["nodes"]:
                 cards = [l["id"] for l in self._links(u["id"])["in"] if l["relation"] == "from_unit"]
                 if cards:
-                    out[str(u["attrs"]["order"])] = cards
+                    out.setdefault(u["attrs"]["text"], []).extend(cards)
             return out
 
     def canvas(self) -> dict:

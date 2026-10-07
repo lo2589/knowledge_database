@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="km-app" content="known-manage">
+<title>知识树</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="vendor/cdn-assets/styles/github.min.css">
+<link rel="stylesheet" href="print.css">
+</head>
+<body>
+<div id="tools">
+  <span id="where"></span>
+  <button id="do-print">打印 / 另存为 PDF</button>
+  <button id="do-close">关闭</button>
+  <span id="hint">在打印对话框里把「目标」选成「另存为 PDF」，就能拿到 PDF 文件</span>
+</div>
+<div id="doc"><p class="loading">正在排版…</p></div>
+
+<script src="vendor/markdown-it/markdown-it.min.js"></script>
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/katex/contrib/mhchem.min.js"></script>
+<script src="vendor/dompurify/purify.min.js"></script>
+<script src="vendor/cdn-assets/highlight.min.js"></script>
+<script src="render.js"></script>
+<script src="print.js"></script>
+</body>
+</html>

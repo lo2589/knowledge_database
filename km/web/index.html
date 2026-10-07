@@ -7,20 +7,21 @@
 <title>知识图</title>
 <link rel="stylesheet" href="vendor/katex/katex.min.css">
 <link rel="stylesheet" href="vendor/cdn-assets/styles/github.min.css">
-<link rel="stylesheet" href="graph.css">
+<link rel="stylesheet" href="graph.css?v=20261005p">
 </head>
 <body>
 <header id="bar">
+  <button id="outline-toggle" class="icon-btn top-tool" title="展开目录" aria-label="展开目录">☰</button>
+  <button id="mode-toggle" class="icon-btn top-tool" title="切换 Outliner" aria-label="切换 Outliner">☷</button>
+  <button id="relation-toggle" class="icon-btn top-tool" title="关系索引" aria-label="关系索引">⌁</button>
+  <button id="new-card" class="icon-btn top-tool" title="新建卡片" aria-label="新建卡片">＋</button>
   <div class="grp">
-    <select id="repo" title="知识仓库"></select>
-    <input id="repo-new" class="w-md" placeholder="新仓库名 或 .db 路径，回车">
-  </div>
-  <div class="grp">
-    <input id="search" class="w-sm" placeholder="搜卡片（命中的自动展开）">
-    <button id="expand">全部展开</button>
-    <button id="collapse">全部收起</button>
-    <button id="fit">适配</button>
-    <button id="export">导出 JSON</button>
+    <input id="search" class="w-sm" placeholder="搜索卡片（回车跳下一个）">
+    <button id="hit-prev" class="icon-btn top-tool" title="上一个（Shift+回车 / ↑）" aria-label="上一个">↑</button>
+    <button id="hit-next" class="icon-btn top-tool" title="下一个（回车 / ↓）" aria-label="下一个">↓</button>
+    <span id="hit-count" class="hits"></span>
+    <button id="fit" title="自适应：重新排版整棵树并让全部内容进入视野（手动摆过的卡片也回到树上）">自适应</button>
+    <button id="export" title="导出：Mermaid 图 / Markdown 大纲 / JSON 数据">导出</button>
   </div>
   <div class="grp">
     <input id="import" class="w-md" placeholder="导入：路径或粘贴文字，回车">
@@ -32,6 +33,30 @@
   <div id="stage">
     <div id="layer"></div>
     <div id="msg" hidden></div>
+    <div id="edge-panel" hidden></div>
+    <div id="relation-index" hidden></div>
+    <div id="quick-card" hidden>
+      <input id="quick-title" placeholder="标题（可留空，自动取正文首句）">
+      <textarea id="quick-body" placeholder="正文，支持 Markdown / 公式"></textarea>
+      <div class="quick-actions"><button id="quick-save">挂到当前节点</button><button id="quick-save-child">挂到选中的卡下面</button><button id="quick-cancel">取消</button></div>
+    </div>
+    <div id="export-panel" hidden>
+      <div class="ex-head"><b>导出</b><button class="icon-btn" id="export-close" title="关闭" aria-label="关闭">×</button></div>
+      <div class="ex-opts">
+        <button data-ex="markdown" title="整棵树变成 Markdown 文档：标题层级、正文、原文引用、关系、核对">Markdown 大纲</button>
+        <button data-ex="mermaid" title="Mermaid 流程图：严格层级 + 语义关系 + 核对配色，只带标题">Mermaid 图</button>
+        <button data-ex="mermaid-full" title="同上的 Mermaid 图，节点里带上卡片正文">Mermaid 图（含正文）</button>
+        <button data-ex="json" title="完整数据：层级结构 + 每张卡的内容、原文、关系">JSON 数据</button>
+        <button data-ex="pdf" title="按打印版式排成 A4 PDF（公式、代码、中文都在），直接下载成 .pdf">PDF</button>
+      </div>
+      <textarea id="export-text" readonly spellcheck="false" placeholder="点上面一种格式，内容会出现在这里（可直接选中复制）"></textarea>
+      <div class="ex-actions">
+        <button id="export-download" disabled>下载文件</button>
+        <button id="export-copy" disabled>复制全部</button>
+        <button id="export-print" title="在新标签页打开打印版式：打印对话框里选「另存为 PDF」">打印 / 另存为 PDF</button>
+        <span id="export-note"></span>
+      </div>
+    </div>
   </div>
 </div>
 <footer id="legend"></footer>
@@ -42,6 +67,6 @@
 <script src="vendor/dompurify/purify.min.js"></script>
 <script src="vendor/cdn-assets/highlight.min.js"></script>
 <script src="render.js"></script>
-<script src="graph.js"></script>
+<script src="graph.js?v=20261005p"></script>
 </body>
 </html>

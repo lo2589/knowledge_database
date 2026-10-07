@@ -3,11 +3,8 @@
 // Runs in the dsh (Cordis) process at boot. Three jobs:
 //   1. keep the known_manage server (Python, FastNode storage) running and say
 //      where it is (/plugins/known-manage/status);
-//   2. read a dsh session from disk and send its raw Markdown to that server
-//      (/plugins/known-manage/ingest). Raw, not rendered: formulas arrive as
-//      the $…$ / \( \) source the model wrote, code blocks keep their fences;
-//   3. tell the sidebar which folder the conversation works in, so "import a
-//      folder" can default to the current repository (/plugins/known-manage/session).
+//   2. read a dsh session from disk when the graph asks what a card came from
+//      (/plugins/known-manage/pick, /plugins/known-manage/session).
 //
 // Session files are ~/.dsh/sessions/<workspace>/<session-id>/session.jsonl.zstd:
 // newline-delimited events written as many concatenated zstd frames, so every
@@ -95,28 +92,6 @@ function sessionInfo(events) {
   const head = events.find((e) => e.type === 'session') || {}
   const titled = events.filter((e) => e.type === 'session/title').pop()
   return { cwd: head.cwd || '', title: (titled && titled.data && titled.data.title) || '' }
-}
-
-function messagesFor(sessionsDir, sessionId, messageId, scope) {
-  const events = readEvents(findSession(sessionsDir, sessionId))
-  const info = sessionInfo(events)
-  const all = turns(events)
-  let picked = all
-  if (scope !== 'session') {
-    const hit = all.find((t) => t.assistant.some((a) => a.id === messageId))
-    if (!hit) throw new Error('会话里没找到这条回答（可能还没写盘，稍等再试）')
-    picked = [hit]
-  }
-  const messages = []
-  for (const t of picked) {
-    if (t.user) messages.push({ speaker: 'user', text: t.user })
-    const said = t.assistant.map((a) => a.text).filter(Boolean).join('\n\n')
-    if (said) messages.push({ speaker: 'assistant', text: said })
-  }
-  if (!messages.length) throw new Error('这里没有可入库的文字')
-  const first = (picked[0] && picked[0].user) || info.title || '对话'
-  const title = (scope === 'session' ? '会话：' + (info.title || first) : first).replace(/\s+/g, ' ').slice(0, 60)
-  return { messages, title, cwd: info.cwd }
 }
 
 module.exports = {
@@ -257,21 +232,6 @@ module.exports = {
         }),
       }), 'known-manage:status')
 
-      ctx.effect(() => server.register({
-        kind: 'exact', path: '/plugins/known-manage/ingest',
-        handler: async (req, res) => {
-          try {
-            const body = await readBody(req)
-            if (!state.port) await start()
-            const m = messagesFor(sessionsDir, body.sessionId, body.messageId, body.scope)
-            const made = await kmPost('/api/sources', { messages: m.messages, title: m.title, format: 'dsh-turn' })
-            const src = made.sources[0]
-            send(res, 200, { ok: true, source: src.id, units: src.units, title: src.title, cwd: m.cwd })
-          } catch (e) {
-            send(res, 400, { ok: false, error: String(e && e.message || e) })
-          }
-        },
-      }), 'known-manage:ingest')
 
       // The chat side: split an answer into pickable sentences, turn one into
       // a card, and report which ones already are.
@@ -291,18 +251,62 @@ module.exports = {
             if (!b.sessionId || !b.messageId || !b.text) throw new Error('缺少 sessionId / messageId / text')
             const q = questionFor(b.sessionId, b.messageId)
             const card = await kmPost('/api/pick', { text: b.text, origin: {
-              kind: 'dsh', session: b.sessionId, message: b.messageId, index: b.index, question: q.question, cwd: q.cwd } })
+              kind: 'dsh', session: b.sessionId, message: b.messageId, index: b.index,
+              turn: Number.isFinite(b.turn) ? b.turn : null,
+              speaker: b.speaker === 'user' ? 'user' : 'assistant',
+              question: b.speaker === 'user' ? b.text : q.question, cwd: q.cwd } })
             send(res, 200, { ok: true, card: card.id, title: card.title })
           } catch (e) { send(res, 400, { ok: false, error: String(e && e.message || e) }) }
         },
       }), 'known-manage:pick')
 
+      // A box of sentences picked in one gesture. Each becomes a card; with
+      // merge the cards are then folded into the first one, keeping every body
+      // and every origin — 「框几句合成一张」 without twenty round trips.
+      ctx.effect(() => server.register({
+        kind: 'exact', path: '/plugins/known-manage/pick-many',
+        handler: async (req, res) => {
+          try {
+            const b = await readBody(req)
+            const items = (Array.isArray(b.items) ? b.items : []).filter((it) => it && it.text)
+            if (!b.sessionId || !items.length) throw new Error('缺少 sessionId / items')
+            const questions = new Map()
+            const question = (messageId) => {
+              if (!questions.has(messageId)) questions.set(messageId, questionFor(b.sessionId, messageId))
+              return questions.get(messageId)
+            }
+            const made = []
+            for (const it of items) {
+              const q = question(it.messageId)
+              const card = await kmPost('/api/pick', { text: it.text, origin: {
+                kind: 'dsh', session: b.sessionId, message: it.messageId, index: it.index,
+                turn: Number.isFinite(it.turn) ? it.turn : null,
+                speaker: it.speaker === 'user' ? 'user' : 'assistant',
+                question: it.speaker === 'user' ? it.text : q.question, cwd: q.cwd } })
+              made.push({ id: card.id, title: card.title })
+            }
+            let merged = null
+            if (b.merge && made.length > 1) {
+              // Merging is a library route: it needs the session it works in.
+              const q = '?s=' + encodeURIComponent(b.sessionId)
+              for (const card of made.slice(1)) {
+                await kmPost('/api/cards/merge' + q, { source: card.id, target: made[0].id })
+              }
+              merged = made[0].id
+            }
+            send(res, 200, { ok: true, cards: made.map((c) => c.id), merged,
+                             title: made[0] && made[0].title, count: made.length })
+          } catch (e) { send(res, 400, { ok: false, error: String(e && e.message || e) }) }
+        },
+      }), 'known-manage:pick-many')
+
       ctx.effect(() => server.register({
         kind: 'exact', path: '/plugins/known-manage/picked',
         handler: async (req, res) => {
           try {
-            const id = new URL(req.url, 'http://x').searchParams.get('message') || ''
-            const [picked, target] = await Promise.all([kmGet('/api/picked?message=' + encodeURIComponent(id)), kmGet('/api/target')])
+            const q = new URL(req.url, 'http://x').searchParams
+            const id = q.get('message') || '', sq = '&s=' + encodeURIComponent(q.get('s') || '')
+            const [picked, target] = await Promise.all([kmGet('/api/picked?message=' + encodeURIComponent(id) + sq), kmGet('/api/target?x=1' + sq)])
             send(res, 200, { picked, target: target.target })
           } catch (e) { send(res, 400, { error: String(e && e.message || e) }) }
         },
@@ -328,4 +332,4 @@ module.exports = {
   },
 }
 
-module.exports.helpers = { readEvents, turns, messagesFor, sessionInfo, findSession }
+module.exports.helpers = { readEvents, turns, sessionInfo, findSession }

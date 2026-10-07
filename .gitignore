@@ -1,8 +1,27 @@
+# 运行产物：会话各自的库、请求日志、自检报告
+data/
+
+# Python
 .venv/
 __pycache__/
 *.pyc
-data/
+
+# SQLite
 *.db
 *.db-shm
 *.db-wal
+
+# 录屏证据：文件留在本地，不进仓库（一个 .mov 就 800MB）
+evidence/*.mov
+evidence/*.mp4
+evidence/raw/
+
+# 代码分析工具留下的缓存
+.code_genome_db.json
+.code_genome_db.json.lock
+.code_hash_db.json
+.code_hash_db.json.lock
+.codedendrite/
+.codedendrite_ignore
+
 .DS_Store

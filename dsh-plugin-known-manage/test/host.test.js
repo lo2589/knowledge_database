@@ -5,7 +5,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const zlib = require('node:zlib')
-const { readEvents, turns, messagesFor, sessionInfo, findSession } = require('../src/host.js').helpers
+const { readEvents, turns, sessionInfo, findSession } = require('../src/host.js').helpers
 
 // A session file the way dsh writes it: one zstd frame per append.
 function writeSession(dir, id, events) {
@@ -43,24 +43,24 @@ test('only what a person typed opens a turn; harness context is dropped', () => 
   assert.deepStrictEqual(t[0].assistant.map((a) => a.id), ['m1', 'm2'])
 })
 
-test('one turn keeps formulas and code fences as written, without reasoning or tool calls', () => {
-  const m = messagesFor(dir, 'session-abc', 'm2', 'turn')
-  assert.strictEqual(m.title, '为什么要除以 $\\sqrt{d_k}$？')
-  assert.strictEqual(m.cwd, '/work/repo')
-  assert.deepStrictEqual(m.messages, [
-    { speaker: 'user', text: '为什么要除以 $\\sqrt{d_k}$？' },
-    { speaker: 'assistant', text: '先看方差：$\\operatorname{Var}(q\\cdot k)=d_k$。\n\n```python\natt = q @ k.T / math.sqrt(k.size(-1))\n```' },
-  ])
+test('turns keep formulas and code fences as written, without reasoning or tool calls', () => {
+  const t = turns(readEvents(findSession(dir, 'session-abc')))
+  assert.strictEqual(t[0].assistant[0].text, '先看方差：$\\operatorname{Var}(q\\cdot k)=d_k$。')
+  assert.strictEqual(t[0].assistant[1].text, '```python\natt = q @ k.T / math.sqrt(k.size(-1))\n```')
+  assert.ok(!t[0].assistant[0].text.includes('hidden thoughts'))
 })
 
-test('whole session', () => {
-  const m = messagesFor(dir, 'session-abc', null, 'session')
-  assert.strictEqual(m.messages.length, 4)
-  assert.strictEqual(m.title, '会话：缩放')
-  assert.deepStrictEqual(sessionInfo(readEvents(findSession(dir, 'session-abc'))), { cwd: '/work/repo', title: '缩放' })
+test('the session header reads as the folder the conversation works in', () => {
+  assert.deepStrictEqual(sessionInfo(readEvents(findSession(dir, 'session-abc'))),
+    { cwd: '/work/repo', title: '缩放' })
 })
 
 test('bad ids are refused, not searched for', () => {
   assert.throws(() => findSession(dir, '../etc'), /会话 id 不对/)
-  assert.throws(() => messagesFor(dir, 'session-abc', 'nope', 'turn'), /没找到这条回答/)
+})
+
+test('whole-段 ingest is gone: no helper and no route stay behind', () => {
+  const mod = require('../src/host.js')
+  assert.strictEqual(mod.helpers.messagesFor, undefined)
+  assert.ok(!fs.readFileSync(path.join(__dirname, '..', 'src', 'host.js'), 'utf8').includes('/plugins/known-manage/ingest'))
 })
