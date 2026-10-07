@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="km-app" content="known-manage">
+<title>Codex 知识对话</title>
+<link rel="stylesheet" href="vendor/katex/katex.min.css">
+<link rel="stylesheet" href="vendor/cdn-assets/styles/github.min.css">
+<link rel="stylesheet" href="chat.css">
+</head>
+<body>
+<div id="app">
+  <section id="left">
+    <header id="bar">
+      <b>Codex 知识对话</b>
+      <label class="cwd" title="Codex 在这个目录里工作（只读）">目录
+        <input id="cwd" spellcheck="false">
+      </label>
+      <span class="grow"></span>
+      <button id="chats" title="最近对话">最近</button>
+      <button id="new" title="开一个新对话（新会话、新知识库）">新对话</button>
+    </header>
+    <div id="log"></div>
+    <div id="composer">
+      <textarea id="ask" rows="1" placeholder="问 Codex……（Enter 发送，Shift+Enter 换行）"></textarea>
+      <div class="send-row">
+        <span id="hint">回答里的每一句都能点：点了就挂到右边知识图的挂载点下面</span>
+        <button id="stop" hidden>停止</button>
+        <button id="send">发送</button>
+      </div>
+    </div>
+  </section>
+  <div id="grip" title="拖动调整宽度"></div>
+  <section id="right">
+    <iframe id="graph" title="知识图"></iframe>
+  </section>
+</div>
+<div id="chats-panel" hidden></div>
+<div id="toast" hidden></div>
+
+<script src="vendor/markdown-it/markdown-it.min.js"></script>
+<script src="vendor/katex/katex.min.js"></script>
+<script src="vendor/katex/contrib/mhchem.min.js"></script>
+<script src="vendor/dompurify/purify.min.js"></script>
+<script src="vendor/cdn-assets/highlight.min.js"></script>
+<script src="render.js"></script>
+<script src="chat.js"></script>
+</body>
+</html>

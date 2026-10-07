@@ -1,4 +1,6 @@
 import json
+import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -6,6 +8,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
+from km import chat as codex
 from km.importers import chat_export, claude_code_transcript, html_to_markdown, load_text
 from km.repos import Repos
 from km.server import Api, make_handler
@@ -643,3 +646,140 @@ class SessionApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A Codex CLI that answers the way the real one does, without the network.
+# It records its own argv, so a test can see whether the second turn resumed the
+# thread the first one started.
+FAKE_CODEX = """#!/bin/sh
+echo "$@" >> "$FAKE_CODEX_LOG"
+cat > /dev/null
+printf '%s\\n' '{"type":"thread.started","thread_id":"thread-42"}'
+printf '%s\\n' '{"type":"turn.started"}'
+printf '%s\\n' '{"type":"item.completed","item":{"id":"i1","type":"reasoning","text":"先想一下。\\n"}}'
+printf '%s\\n' '{"type":"item.completed","item":{"id":"i2","type":"command_execution","name":"bash","command":"ls -1","status":"completed"}}'
+printf '%s\\n' '{"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"缩放点积先算 QK。再除以根号 d_k。"}}'
+printf '%s\\n' '{"type":"turn.completed","usage":{"input_tokens":12,"output_tokens":7}}'
+"""
+
+
+class ChatTests(unittest.TestCase):
+    """The Codex web page: one turn streams, gets saved, and resumes its thread."""
+
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.chats = Path(tempfile.mkdtemp())
+        self.log = Path(tempfile.mkdtemp()) / "argv.log"
+        self.fake = Path(tempfile.mkdtemp()) / "codex"
+        self.fake.write_text(FAKE_CODEX, encoding="utf-8")
+        self.fake.chmod(self.fake.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+        self._env = {"KM_CODEX": str(self.fake), "FAKE_CODEX_LOG": str(self.log)}
+        self._old = {k: os.environ.get(k) for k in self._env}
+        os.environ.update(self._env)
+        api = Api(Repos(self.home))
+        api.chats_home = self.chats
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(api))
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_port}"
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def tearDown(self):
+        self.server.shutdown()
+        for k, v in self._old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def call(self, method, path, body=None):
+        req = urllib.request.Request(self.base + path, method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with self.opener.open(req, timeout=10) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def stream(self, body):
+        req = urllib.request.Request(self.base + "/api/chat", method="POST",
+                                     data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        with self.opener.open(req, timeout=30) as r:
+            raw = r.read().decode()
+        return [json.loads(line) for line in raw.splitlines() if line.strip()]
+
+    def test_the_cli_stream_is_turned_into_page_events(self):
+        raw = [
+            {"type": "thread.started", "thread_id": "t-9"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"id": "a", "type": "agent_message", "text": "第一句。"}},
+            {"type": "item.completed", "item": {"id": "b", "type": "reasoning", "text": "想想"}},
+            {"type": "item.completed", "item": {"id": "c", "type": "command_execution", "name": "bash", "command": ["ls", "-1"]}},
+            {"type": "item.completed", "item": {"id": "d", "type": "error", "message": "网络抖了一下"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 3, "output_tokens": 2}},
+            {"type": "error", "message": "Reconnecting... 2/5"},
+            {"type": "error", "message": "真出错了"},
+        ]
+        got = [e for r in raw for e in codex.normalize(r)]
+        self.assertEqual([e["event"] for e in got],
+                         ["thread", "turn", "text", "reasoning", "tool", "error", "usage", "status", "error"])
+        self.assertEqual(got[0]["thread"], "t-9")
+        self.assertEqual(got[2]["text"], "第一句。")
+        self.assertEqual(got[4]["detail"], "ls -1")
+        self.assertEqual(got[6]["usage"]["output_tokens"], 2)
+        self.assertEqual(got[7]["message"], "Reconnecting... 2/5")   # progress, not failure
+        self.assertEqual(got[8]["message"], "真出错了")
+
+    def test_one_turn_streams_is_saved_and_the_next_one_resumes_it(self):
+        events = self.stream({"chat": "codex-test", "prompt": "缩放点积是什么", "cwd": str(self.home)})
+        kinds = [e["event"] for e in events]
+        self.assertEqual(kinds[0], "chat")
+        for wanted in ("thread", "text", "reasoning", "tool", "usage", "saved"):
+            self.assertIn(wanted, kinds)
+        self.assertEqual([e for e in events if e["event"] == "text"][0]["text"], "缩放点积先算 QK。再除以根号 d_k。")
+
+        # the conversation is on disk, so a reload shows it again
+        stored = json.loads((self.chats / "codex-test.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["thread"], "thread-42")
+        self.assertEqual(stored["turns"][0]["q"], "缩放点积是什么")
+        self.assertIn("缩放点积先算 QK", stored["turns"][0]["a"])
+        self.assertEqual(stored["turns"][0]["usage"]["output_tokens"], 7)
+        self.assertEqual(self.call("GET", "/api/chat/codex-test")[1]["turns"][0]["q"], "缩放点积是什么")
+
+        # the second turn continues the same Codex thread
+        self.stream({"chat": "codex-test", "prompt": "再讲讲 mask"})
+        argv = self.log.read_text(encoding="utf-8").strip().splitlines()
+        self.assertEqual(len(argv), 2)
+        self.assertIn("resume thread-42", argv[1])
+        self.assertIn("--json", argv[1])
+        self.assertNotIn("resume", argv[0])
+        stored = json.loads((self.chats / "codex-test.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(stored["turns"]), 2)
+
+    def test_the_page_and_its_library_are_served(self):
+        with self.opener.open(self.base + "/chat", timeout=5) as r:
+            page = r.read().decode()
+        self.assertEqual(r.status, 200)
+        self.assertIn("Codex 知识对话", page)
+
+        # what the page picks lands in that chat's own library
+        code, card = self.call("POST", "/api/pick?s=codex-test", {
+            "text": "缩放点积先算 QK。", "title": "",
+            "origin": {"kind": "codex", "session": "codex-test", "message": "codex-test-0-a",
+                       "index": 0, "turn": 0, "speaker": "assistant", "question": "缩放点积是什么"}})
+        self.assertEqual(code, 200)
+        origin = card["origins"][0]
+        self.assertEqual((origin["agent"], origin["session"], origin["turn"]), ("codex", "codex-test", 0))
+        self.assertEqual(origin["source_title"], "缩放点积是什么")
+        code, picked = self.call("GET", "/api/picked?s=codex-test&message=codex-test-0-a")
+        self.assertEqual((code, picked), (200, {"缩放点积先算 QK。": [card["id"]]}))
+
+    def test_a_missing_codex_cli_is_reported_in_plain_words(self):
+        os.environ["KM_CODEX"] = "/nonexistent/codex"
+        try:
+            code, out = self.call("POST", "/api/chat", {"chat": "codex-nope", "prompt": "在吗"})
+        finally:
+            os.environ.update(self._env)
+        self.assertEqual(code, 400)
+        self.assertIn("KM_CODEX", out["error"])
+        self.assertTrue(codex.find_codex())   # the real one is still found afterwards

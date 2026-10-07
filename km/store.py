@@ -32,6 +32,14 @@ RELATIONS = {
     "related": "相关",
 }
 STATUSES = ("new", "kept", "dropped")
+# Which chat a sentence was picked in. "dsh" is the harness this was built for;
+# "codex" is the web page that drives the Codex CLI; "claude" is there for a
+# Claude Code page of the same shape. The name goes into the source, and every
+# card reaches back to the chat it came from through it.
+CHAT_AGENTS = ("dsh", "codex", "claude")
+# Sources that are a chat, not an imported document: their text is on screen in
+# their own pane, so the whiteboard must not draw them as an import.
+CHAT_FORMATS = ("dsh", "codex", "claude")
 PARENT = "belongs_to"
 # Did what the LLM said hold up? Set by you after checking against a source.
 # "fixed": the LLM got it wrong and the card now says what the source says.
@@ -779,9 +787,13 @@ class KnowledgeStore:
                     continue
                 src = self.db.get(u["attrs"]["source"], links="none")
                 sa = src["attrs"] if src else {}
+                agent = sa.get("chat_agent") or ("dsh" if sa.get("dsh_message") else None)
                 origins.append({"unit": u["id"], "text": u["attrs"]["text"], "source": u["attrs"]["source"],
                                 "index": u["attrs"].get("order", 0),
                                 "source_title": sa.get("title", "（资料已删除）"),
+                                "agent": agent, "session": sa.get("chat_session") or sa.get("dsh_session"),
+                                "message": sa.get("chat_message") or sa.get("dsh_message"),
+                                "turn": sa.get("chat_turn") if sa.get("chat_turn") is not None else sa.get("dsh_turn"),
                                 "dsh_session": sa.get("dsh_session"), "dsh_message": sa.get("dsh_message"),
                                 "dsh_turn": sa.get("dsh_turn")})
         return {"id": cid, "title": a["title"], "body": a["body"], "created": a["created"],
@@ -806,31 +818,42 @@ class KnowledgeStore:
             return cid
 
     def pick(self, text: str, origin: dict, parent: int | None = None, title: str = "") -> dict:
-        """One sentence chosen in the chat becomes a card under `parent` (default:
+        """One sentence chosen in a chat becomes a card under `parent` (default:
         the current target). The sentence is kept as a unit of a source for its
-        message, so the card links back to exactly where it was said."""
+        message, so the card links back to exactly where it was said.
+
+        @param origin - {"kind": "dsh" | "codex" | "claude", "session": …,
+            "message": …, "index": …, "turn": …, "speaker": …} — the chat the
+            sentence was picked in.
+        @throws ValueError when the text is empty or the origin names no message.
+        """
         text = (text or "").strip()
         if not text:
             raise ValueError("选中的内容是空的")
-        if origin.get("kind") != "dsh" or not origin.get("message"):
-            raise ValueError("origin 需要 kind=dsh 和 message")
+        agent = str(origin.get("kind") or "").strip()
+        if agent not in CHAT_AGENTS or not origin.get("message"):
+            raise ValueError(f"origin 需要 kind（{'/'.join(CHAT_AGENTS)}）和 message")
         parent = parent if parent is not None else self.target()
         with self.lock:
             msg, sess, idx = str(origin["message"]), str(origin.get("session", "")), int(origin.get("index", 0))
-            hit = self.db.query({"predicate": {"op": "and", "args": [
-                {"op": "eq", "field": "@type", "value": "source"},
-                {"op": "eq", "field": "/dsh_message", "value": msg}]}, "limit": 1})["ids"]
             turn = origin.get("turn")
+            hit = self.db.query({"predicate": {"op": "or", "args": [
+                {"op": "eq", "field": "/chat_message", "value": msg},
+                {"op": "eq", "field": "/dsh_message", "value": msg}]}, "limit": 1})["ids"]
             if hit:
                 sid = hit[0]
                 if turn is not None:
-                    self.db.patch(sid, {"attrs": {"dsh_turn": int(turn)}})
+                    self.db.patch(sid, {"attrs": {"chat_turn": int(turn)}})
             else:
                 q = (origin.get("question") or "对话").replace("\n", " ").strip()
-                sid = self.db.create({"type": "source", "summary": plain(q, 120),
-                                      "attrs": {"title": q[:80], "format": "dsh", "created": now_ms(),
-                                                "dsh_session": sess, "dsh_message": msg, "cwd": origin.get("cwd", ""),
-                                                "dsh_turn": None if turn is None else int(turn)}})
+                attrs = {"title": q[:80], "format": agent, "created": now_ms(),
+                         "chat_agent": agent, "chat_session": sess, "chat_message": msg,
+                         "chat_turn": None if turn is None else int(turn),
+                         "cwd": origin.get("cwd", "")}
+                if agent == "dsh":   # the plugin and older libraries read these
+                    attrs.update({"dsh_session": sess, "dsh_message": msg,
+                                  "dsh_turn": None if turn is None else int(turn)})
+                sid = self.db.create({"type": "source", "summary": plain(q, 120), "attrs": attrs})
             unit = self.db.query({"predicate": {"op": "and", "args": [
                 {"op": "eq", "field": "/source", "value": sid},
                 {"op": "eq", "field": "/text", "value": text}]}, "limit": 1})["ids"]
@@ -847,8 +870,8 @@ class KnowledgeStore:
     def picked(self, message: str) -> dict:
         """Cards keyed by exact source text, stable when split positions change."""
         with self.lock:
-            hit = self.db.query({"predicate": {"op": "and", "args": [
-                {"op": "eq", "field": "@type", "value": "source"},
+            hit = self.db.query({"predicate": {"op": "or", "args": [
+                {"op": "eq", "field": "/chat_message", "value": str(message)},
                 {"op": "eq", "field": "/dsh_message", "value": str(message)}]}, "limit": 1})["ids"]
             if not hit:
                 return {}
@@ -887,8 +910,8 @@ class KnowledgeStore:
             res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "source"},
                                  "order_by": {"field": "/created", "direction": "desc"}, "include_data": True, "limit": 1000})
             for n in res["nodes"]:
-                if n["attrs"].get("format") == "dsh":
-                    continue  # their text lives in the chat on the left
+                if n["attrs"].get("format") in CHAT_FORMATS:
+                    continue  # their text lives in the chat they came from
                 sources.append({"id": n["id"], "title": n["attrs"]["title"]})
             return {"root": self.root, "target": target, "nodes": nodes, "sources": sources,
                     "refs": [{"from": int(r["from"][1:]), "to": int(r["to"][1:]), "relation": r["relation"]} for r in data["refs"]]}

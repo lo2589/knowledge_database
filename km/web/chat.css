@@ -1,0 +1,103 @@
+/* The Codex web page: chat on the left, knowledge graph on the right, one
+   screen, nothing to switch to. Same palette as the whiteboard on purpose —
+   they are two halves of one workspace. */
+:root {
+  --bg: #faf9f7; --panel: #ffffff; --ink: #23221f; --muted: #8b8880; --line: #e8e5df; --hover: #f4f2ee;
+  --accent: #3a63a8; --accent-soft: #eef1f7; --keep: #4f7f66; --shadow: 0 6px 22px rgba(35,34,31,.09);
+}
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { height: 100%; margin: 0; overflow: hidden; }
+body { background: var(--bg); color: var(--ink);
+       font: 13.5px/1.6 -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; }
+button { font: inherit; color: inherit; cursor: pointer; border: 1px solid var(--line); background: var(--panel);
+         border-radius: 6px; padding: 3px 10px; }
+button:hover { border-color: var(--accent); color: var(--accent); }
+button:disabled { opacity: .5; cursor: default; }
+input, textarea { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+                  border-radius: 6px; padding: 4px 8px; min-width: 0; }
+input:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
+#app { display: flex; height: 100%; min-height: 0; }
+#left { display: flex; flex-direction: column; min-width: 320px; min-height: 0; background: var(--bg); }
+#right { flex: 1; min-width: 300px; min-height: 0; border-left: 1px solid var(--line); background: var(--panel); }
+#graph { width: 100%; height: 100%; border: 0; display: block; }
+#grip { flex: 0 0 6px; cursor: col-resize; background: linear-gradient(var(--line), var(--line)) center / 1px 100% no-repeat; }
+#grip:hover, #grip.on { background: var(--accent-soft); }
+
+#bar { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-bottom: 1px solid var(--line);
+       background: var(--panel); flex-wrap: wrap; }
+#bar b { font-size: 13.5px; }
+#bar .grow { flex: 1; }
+#bar .cwd { display: flex; align-items: center; gap: 5px; color: var(--muted); font-size: 12px; flex: 1 1 220px; min-width: 0; }
+#bar .cwd input { flex: 1; font-size: 12px; }
+
+#log { flex: 1; min-height: 0; overflow-y: auto; padding: 14px 16px 24px; }
+.turn { margin: 0 0 18px; }
+.q { display: flex; justify-content: flex-end; margin: 0 0 10px; }
+.q .bubble { max-width: 86%; background: #edf0f4; border-radius: 16px; padding: 7px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.a { max-width: 100%; }
+.a .who { color: var(--muted); font-size: 11.5px; margin: 0 0 3px; display: flex; gap: 8px; align-items: baseline; }
+.a .who .tok { margin-left: auto; }
+.think { margin: 2px 0 6px; }
+.think > summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.think .body { color: #5b5852; border-left: 2px solid var(--line); padding: 2px 10px; margin: 3px 0 6px;
+               font-size: 12.5px; white-space: pre-wrap; }
+.status { color: var(--muted); font-size: 11.5px; margin: 2px 0 4px; font-style: italic; }
+.tools { color: var(--muted); font-size: 11.5px; margin: 2px 0 6px; }
+.tools div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.answer { overflow-wrap: anywhere; }
+.answer > :first-child { margin-top: 0; }
+.answer > :last-child { margin-bottom: 0; }
+.err { color: #b3361f; background: #fbe9e5; border: 1px solid #f0a596; border-radius: 8px; padding: 7px 10px;
+       margin: 4px 0; font-size: 12.5px; white-space: pre-wrap; }
+.raw { color: var(--muted); font: 11.5px ui-monospace, monospace; white-space: pre-wrap; }
+
+/* sentences: the picking surface, same behaviour as the dsh chat */
+.km-ans { display: flex; flex-direction: column; gap: 2px; }
+.km-s { position: relative; border-radius: 6px; padding: 1px 6px 1px 8px; margin-left: -8px; cursor: pointer;
+        border-left: 3px solid transparent; transition: background .12s; }
+.km-s:hover { background: rgba(47,91,211,.07); border-left-color: rgba(47,91,211,.45); }
+.km-s.picked { background: rgba(31,122,74,.07); border-left-color: #1f7a4a; padding-right: 64px; }
+.km-s.busy { opacity: .55; }
+.km-s.flash { animation: kmflash 2.2s ease; }
+.km-s.km-multi { background: rgba(47,91,211,.13); border-left-color: #2f5bd3; box-shadow: inset 0 0 0 1px rgba(47,91,211,.35); }
+@keyframes kmflash { 0%,45% { background: rgba(242,201,76,.55); box-shadow: 0 0 0 2px #f2c94c } 100% { background: transparent } }
+.km-s .km-tag { position: absolute; right: 6px; top: 2px; font-size: 11px; color: var(--keep);
+                background: rgba(255,255,255,.85); border-radius: 4px; padding: 0 4px; }
+.km-s > div p:last-child { margin-bottom: 0; }
+.q .km-s { margin-left: 0; padding: 3px 8px; border-radius: 5px; }
+
+#composer { border-top: 1px solid var(--line); background: var(--panel); padding: 8px 12px 10px; }
+#ask { width: 100%; min-height: 42px; max-height: 30vh; resize: vertical; }
+.send-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+#hint { color: var(--muted); font-size: 11.5px; flex: 1; }
+#send { border-color: var(--accent); color: #fff; background: var(--accent); }
+#send:hover { color: #fff; opacity: .9; }
+
+#toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 30; pointer-events: none;
+         background: #111827; color: #fff; border-radius: 8px; padding: 7px 12px; font-size: 12.5px; }
+#chats-panel { position: fixed; z-index: 25; right: 16px; top: 52px; width: min(360px, 92vw); max-height: 60vh; overflow: auto;
+               background: rgba(255,255,255,.99); border: 1px solid var(--line); border-radius: 10px; box-shadow: var(--shadow); padding: 8px; }
+#chats-panel .row { display: flex; gap: 8px; align-items: baseline; padding: 6px 7px; border-radius: 6px; cursor: pointer; }
+#chats-panel .row:hover { background: var(--hover); }
+#chats-panel .row .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#chats-panel .row .m { color: var(--muted); font-size: 11px; flex: 0 0 auto; }
+#chats-panel .head { color: var(--muted); font-size: 11.5px; padding: 2px 7px 6px; }
+
+/* the box you drag over the conversation */
+.km-marquee { position: fixed; z-index: 26; border: 1px solid #2f5bd3; background: rgba(47,91,211,.10);
+              border-radius: 3px; pointer-events: none; }
+.km-multi-bar { position: fixed; z-index: 27; left: 50%; bottom: 92px; transform: translateX(-50%);
+                display: flex; align-items: center; gap: 8px; background: #111827; color: #fff; border-radius: 10px;
+                padding: 7px 10px; font-size: 12.5px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+.km-multi-bar button { color: #fff; background: rgba(255,255,255,.14); border: 1px solid rgba(255,255,255,.22); }
+.km-multi-bar button:hover { background: rgba(255,255,255,.28); color: #fff; }
+.km-multi-bar button:disabled { opacity: .5; }
+
+@media (max-width: 760px) {
+  #app { flex-direction: column; }
+  #left { min-height: 45vh; }
+  #right { min-height: 40vh; border-left: 0; border-top: 1px solid var(--line); }
+  #grip { display: none; }
+}

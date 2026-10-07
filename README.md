@@ -9,6 +9,7 @@
 5. **归纳**：自己把卡挂进层级树，再连上别的关系（前提、例子、细化、矛盾、相关）。
 6. **看**：严格层级树像 mermaid 那样从上往下画；折叠起来的子树不占位置，兄弟节点自动靠拢；排版跟着面板宽度走，你看的位置、折叠、模式会被记住。
 7. **带走**：一键导出 Markdown 大纲 / Mermaid 图 / JSON / **PDF**，或把某张卡连同它的下级写进对话框接着问。
+8. **不装 dsh 也能用**：网页版 `/chat` 左边是 **Codex 对话**、右边是同一张知识图——聊完一段，把有用的句子点进图里。
 
 为什么结构要自己挂、不让 AI 自动挂：AI 画的结构图更整齐，但人记不住；自己挂的更乱，记得反而牢。挂的这一下就是学习。
 
@@ -142,14 +143,34 @@
 
 ---
 
-## 六、装与跑
+## 六、网页版：左边 Codex 对话，右边知识图（`/chat`）
+
+不经过 dsh，直接在浏览器里：
+
+```
+http://127.0.0.1:8795/chat
+```
+
+- **左边**是 Codex 对话：回答用 dsh 之外的同一个渲染器画（公式、代码、表格都在），**每一句都能点**——点一下就变成右边知识图里的一张卡。
+- **右边**是同一张白板：排版、折叠、搜索、融合、导出、状态保持，全是上面第三、五节里那套，一点没变。中间那条分隔可以拖动，宽度会记住。
+- **每个对话一份知识库**：第一个问题会成为这份库的名字；「新对话」开新的库，「最近」列出以前的对话（每个对话记得自己的 Codex 线程，接着聊是同一个上下文）。
+- **Codex 是用你机器上已经装好的那个**：`codex exec --json`（桌面版自带，或用 `KM_CODEX=/path/to/codex` 指定），所以用的是你已经登录的账号和 `~/.codex/config.toml` 里的模型，不用再配一遍 key。
+- **只读沙箱**：默认 `read-only`，Codex 能读代码、能跑只读命令，但不会改你的文件；要放开就 `KM_CODEX_SANDBOX=workspace-write`。
+- **顶上的「目录」**就是 Codex 的工作目录（读写都限制在它的策略里），默认用 Codex 自己的默认值，改过会记住。
+- 同样支持：**Ctrl/⌘ 拖框选多句**（各做一张卡 / 合成一张卡）、已经入库的句子标 `✓ 已入库` 再点就跳回那张卡、卡片上的 `↗` 跳回左边那句原文并高亮、思考过程折起来、跑了哪些命令、token 用量。
+- **首轮可能要等一两分钟**：Codex CLI 会先试它的 WebSocket 通道，在这个网络上要重试五轮（约 113 秒）才回退到 HTTPS，然后几秒钟就答完。这是 Codex 自己的行为，不是页面卡住——页面会把「Reconnecting… / Falling back…」显示成一行灰色的状态提示，20 秒没动静还会写清楚在等什么。真没拿到回答时，那一轮下面有 **重试这一轮**。
+- 对话存在 `data/chats/<对话 id>.json`（线程 id、目录、每一轮的问答），和卡片所在的库分开存——关掉浏览器再回来，两边都还在。
+
+---
+
+## 七、装与跑
 
 ```bash
 ./setup.sh          # Python 环境 + FastNode + 读 PDF/Word 的库
 ./dsh-install.sh    # 装进 ~/.dsh/profiles/web（先备份 package.json）；装完重启 dsh
 ```
 
-重启 dsh 之后，右栏会出现「知识图」标签；插件会自己用 `.venv` 的 Python 起知识库服务（默认 8795 端口，被占就往后找），并轮流探活、挂了自动拉起。
+重启 dsh 之后，右栏会出现「知识图」标签；插件会自己用 `.venv` 的 Python 起知识库服务（默认 8795 端口，被占就往后找），并轮流探活、挂了自动拉起。同一个服务也提供上面第六节的网页版 `/chat`，不装 dsh 一样能开。
 
 不想装 dsh 也能单独开一个库看（没有 dsh 对话，只能看图和导入）：
 
@@ -164,7 +185,7 @@
 
 ---
 
-## 七、一个会话一个库
+## 八、一个会话一个库
 
 **没有默认库，也没有仓库切换。** 白板永远只显示当前会话自己的那个库（`data/repos/会话-<标题>-<尾号>.db`）：会话第一次打开时建好，以后回到这个会话还是它。别的会话的库不会出现在这里，也拿不到——**请求不带会话 id 时服务端直接拒绝**（`这个白板只属于会话…`）。
 
@@ -172,7 +193,7 @@
 
 ---
 
-## 八、能导入什么
+## 九、能导入什么
 
 导入框里填路径（文件或文件夹），或者直接粘贴文字：
 
@@ -186,7 +207,7 @@
 
 网页里 KaTeX / MathJax 渲染过的公式会还原成 TeX；Jupyter 的 markdown 单元原样、代码单元带语言标记；PDF 抽文字、docx 转 Markdown。
 
-## 九、能显示什么
+## 十、能显示什么
 
 - 公式：`$…$`、`$$…$$`、`\(…\)`、`\[…\]`、`\begin{align}…`、矩阵、```` ```math ````、化学式 `\ce{H2O}`；
 - 代码高亮、表格、引用、列表、图片、链接、mermaid 流程图；
@@ -197,7 +218,7 @@
 
 ---
 
-## 十、卡片之间的关系
+## 十一、卡片之间的关系
 
 | 关系 | 读法 | 画法 |
 |---|---|---|
@@ -211,7 +232,7 @@
 
 正文里的链接：`[[标题]]`、`[[标题|显示的字]]`、`[[#12]]`（按 id）。**改名后别处的引用自动跟着改**；先写了 `[[还没有的卡]]`，等那张卡建好会自动连上；点一下链接就跳到那张卡。
 
-## 十一、层级规则（严格树）
+## 十二、层级规则（严格树）
 
 - 每个库一个根节点，所有卡都在它下面，没有游离的卡；
 - 每张卡有且只有一个上级，不许转圈；
@@ -221,7 +242,7 @@
 
 ---
 
-## 十二、数据怎么存的
+## 十三、数据怎么存的
 
 底层是 [FastNode](../Node)（同级目录 `Node`，SQLite 上的节点库）：
 
@@ -240,7 +261,7 @@ card    一张知识卡片                    card -from_unit-> unit        （�
 
 ---
 
-## 十三、怎么验证的
+## 十四、怎么验证的
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v                 # 拆句 / 导入 / 存储 / 层级 / 接口 / 五种导出 + PDF
@@ -256,13 +277,15 @@ cd ../deepseek-harness && node --import tsx/esm \
 
 ---
 
-## 十四、文件
+## 十五、文件
 
 ```text
 km/split.py        拆句子 / 块（标点、块、表格、编号记录；公式代码图不拆）
 km/importers.py    各种格式 → Markdown（md/txt/tex/rst/html/pdf/docx/ipynb/json/jsonl/文件夹）
 km/store.py        卡片、关系、严格层级、核对、合并、Markdown / Mermaid / JSON 导出（FastNode）
 km/repos.py        会话各自的库（一个会话一个库，没有默认库）
+km/chat.py         把 codex exec --json 驱动成网页里的对话（事件流 → 页面能画的东西）
+km/chats.py        每个 Codex 对话一条记录（线程 id、目录、每轮问答）
 km/pdf.py          用本机浏览器把打印页印成 PDF
 km/server.py       本机 HTTP 接口 + 静态页面
 km/__main__.py     python -m km --port/--repos/--db/--open
@@ -271,6 +294,7 @@ km/web/graph.js    白板交互（排版、拖拽、框选、编辑、关系、�
 km/web/render.js   Markdown + KaTeX + 代码高亮渲染
 km/web/graph.css   白板样式
 km/web/print.*     打印版式 / PDF 用的那一页（print.html + print.js + print.css）
+km/web/chat.*      网页版：左边 Codex 对话 + 右边知识图（chat.html + chat.js + chat.css）
 km/web/vendor/     KaTeX / markdown-it / highlight.js / DOMPurify（本地，断网可用）
 dsh-plugin-known-manage/
   src/host.js      dsh 宿主半边：起知识库服务、读会话文件、/plugins/known-manage/*
@@ -292,7 +316,11 @@ GET    /api/meta                   关系与核对状态的名字、统计、库
 GET    /api/export?fmt=…           markdown | mermaid | mermaid-full | json
 GET    /api/pdf                    浏览器渲染的 A4 PDF（字节流，带下载文件名）
 GET    /print                      打印版式页面（/api/pdf 和「另存为 PDF」用的就是它）
-POST   /api/pick                   一句话入库（origin 带 session/message/turn/…）
+GET    /chat                       网页版：Codex 对话 + 知识图（km/web/chat.*）
+POST   /api/chat                   跑一轮 Codex，把事件流一行一个 JSON 地推回来（NDJSON）
+GET    /api/chat/<id>              某个对话的线程、目录和每一轮
+GET    /api/chats                  最近对话（网页版的「最近」）
+POST   /api/pick                   一句话入库（origin：kind=dsh|codex|claude + session/message/turn/…）
 POST   /api/pick-many              一批句子入库（merge=true 时合成一张）
 GET    /api/picked?message=…       这条消息里哪些句子已经是卡片
 GET    /api/target   POST /api/target          读 / 设挂载点

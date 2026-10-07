@@ -16,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 
+from . import chats
 from .importers import Document, ImportErrorKM, list_claude_sessions, load_bytes, load_folder, load_text
 from .repos import Repos, is_fastnode_db
 from .store import CHECKS, RELATIONS, KnowledgeStore
@@ -24,6 +25,8 @@ WEB = Path(__file__).parent / "web"
 MAX_BODY = 64 * 1024 * 1024
 # Where a page's self-report lands (see Api.route's "diag" branch).
 DIAG_PATH = Path(__file__).resolve().parent.parent / "data" / "repos" / "diag.json"
+# Codex conversations driven by the web page (see km/chat.py).
+CHATS_HOME = Path(__file__).resolve().parent.parent / "data" / "chats"
 # The whiteboard's own constraint report: formulas that are not shown whole.
 SELFCHECK_PATH = Path(__file__).resolve().parent.parent / "data" / "repos" / "selfcheck.json"
 # Every request, one line: who is talking to this server and about which
@@ -40,11 +43,26 @@ class Raw:
         self.filename = filename
 
 
+class Stream:
+    """A response written as it arrives, one JSON object per line: a chat turn."""
+
+    def __init__(self, chunks, ctype: str = "application/x-ndjson; charset=utf-8"):
+        self.chunks = chunks
+        self.ctype = ctype
+
+    def close(self) -> None:
+        close = getattr(self.chunks, "close", None)
+        if callable(close):
+            close()
+
+
 class Api:
     def __init__(self, repos: Repos | KnowledgeStore, claude_root: Path | None = None):
         # A bare store (tests, embedding) is wrapped so the routes see one shape.
         self.repos = repos if isinstance(repos, Repos) else _Fixed(repos)
         self.claude_root = claude_root
+        # Where Codex conversations are kept (tests point this at a temp dir).
+        self.chats_home = CHATS_HOME
         # The port this server is bound to: the PDF is rendered by a browser that
         # has to fetch the print page from here. serve() fills it in.
         self.port = 0
@@ -89,6 +107,15 @@ class Api:
             return [{"kind": u.kind, "text": u.text} for u in split_markdown(str(body.get("text", "")))]
         if parts == ["claude-sessions"]:
             return list_claude_sessions(self.claude_root)
+
+        # The Codex web page: its own conversations, no library needed to list or
+        # read them (the cards picked out of a chat live in that chat's library).
+        if parts == ["chats"]:
+            return {"chats": chats.recent(self.chats_home)}
+        if len(parts) == 2 and parts[0] == "chat" and method == "GET":
+            return chats.load(self.chats_home, parts[1])
+        if parts == ["chat"] and method == "POST":
+            return self._chat_turn(body)
 
         if sessioned:
             s, repo_path = self.repos.store_for(session, title)
@@ -184,6 +211,77 @@ class Api:
             return s.graph()
         raise LookupError(f"没有这个接口：{method} {path}")
 
+    def _chat_turn(self, body: dict) -> Stream:
+        """Run one turn of a Codex conversation and stream what it says.
+
+        The page keeps nothing: the thread to resume, the directory and every
+        turn are written to disk here, so a chat survives a reload and the next
+        turn continues the same conversation.
+
+        @param body - {chat?, prompt, cwd?, sandbox?}.
+        @returns a Stream of newline-delimited events (see km/chat.py).
+        """
+        from . import chat as codex
+        prompt = str(body.get("prompt") or "").strip()
+        if not prompt:
+            raise ValueError("说点什么")
+        chat_id = str(body.get("chat") or "").strip() or chats.new_id()
+        record = chats.load(self.chats_home, chat_id)
+        cwd = str(body.get("cwd") or record.get("cwd") or "").strip()
+        if cwd:
+            home = Path(cwd).expanduser()
+            if not home.is_dir():
+                raise ValueError(f"工作目录不存在：{home}")
+            cwd = str(home)
+        sandbox = str(body.get("sandbox") or os.environ.get("KM_CODEX_SANDBOX") or "read-only")
+        if sandbox not in ("read-only", "workspace-write"):
+            raise ValueError("sandbox 只能是 read-only / workspace-write")
+        model = str(body.get("model") or os.environ.get("KM_CODEX_MODEL") or "") or None
+        turn = codex.start(prompt, thread=record.get("thread") or None, cwd=cwd or None,
+                           model=model, sandbox=sandbox)
+        record["cwd"] = cwd or record.get("cwd", "")
+        record["sandbox"] = sandbox
+        return Stream(self._chat_events(record, prompt, turn))
+
+    def _chat_events(self, record: dict, prompt: str, turn):
+        """The turn's events, plus the bookkeeping around them."""
+        import time as _time
+        answer, reasoning, tools, usage, failed = [], [], [], {}, ""
+        yield self._line({"event": "chat", "chat": record["id"], "thread": record.get("thread", ""),
+                          "cwd": record.get("cwd", "")})
+        try:
+            for event in turn.events():
+                kind = event.get("event")
+                if kind == "thread":
+                    record["thread"] = event.get("thread") or record.get("thread", "")
+                elif kind == "text":
+                    answer.append(event.get("text", ""))
+                elif kind == "reasoning":
+                    reasoning.append(event.get("text", ""))
+                elif kind == "tool":
+                    tools.append({k: event.get(k) for k in ("name", "detail", "status") if event.get(k)})
+                elif kind == "usage":
+                    usage = event.get("usage") or {}
+                elif kind == "error":
+                    failed = event.get("message") or failed
+                yield self._line(event)
+        finally:
+            text = "\n\n".join(a for a in answer if a).strip()
+            record.setdefault("turns", []).append({
+                "q": prompt, "a": text, "at": int(_time.time() * 1000),
+                "reasoning": "\n\n".join(r for r in reasoning if r)[:4000],
+                "tools": tools[:40], "usage": usage, "error": failed,
+            })
+            try:
+                chats.save(self.chats_home, record)
+                yield self._line({"event": "saved", "chat": record["id"], "turns": len(record["turns"])})
+            except OSError as exc:
+                yield self._line({"event": "error", "message": f"对话没能存下来：{exc}"})
+
+    @staticmethod
+    def _line(obj: dict) -> bytes:
+        return (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+
     def _import(self, body: dict, store: KnowledgeStore) -> dict:
         skipped: list[str] = []
         if body.get("messages"):
@@ -269,6 +367,23 @@ def make_handler(api: Api):
                 raw = self.rfile.read(length) if length else b""
                 body = json.loads(raw) if raw else {}
                 out = api.route(method, url.path, parse_qs(url.query), body)
+                if isinstance(out, Stream):
+                    # No Content-Length: the page reads events until the stream
+                    # ends, which is exactly when the turn is over.
+                    self.send_response(200)
+                    self.send_header("Content-Type", out.ctype)
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    try:
+                        for chunk in out.chunks:
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass          # the page went away: chat.py kills the child
+                    finally:
+                        out.close()
+                    return
                 if isinstance(out, Raw):
                     name = quote(out.filename)
                     self._send(200, out.data, out.ctype, {"Content-Disposition": f"attachment; filename*=UTF-8''{name}"})
@@ -283,7 +398,8 @@ def make_handler(api: Api):
                 self._send(500, {"error": f"{type(exc).__name__}: {exc}"})
 
         def _static(self, path: str):
-            rel = "index.html" if path in ("", "/") else "print.html" if path in ("/print", "/print/") else path.lstrip("/")
+            page = {"/print": "print.html", "/print/": "print.html", "/chat": "chat.html", "/chat/": "chat.html"}
+            rel = "index.html" if path in ("", "/") else page.get(path, path.lstrip("/"))
             target = (WEB / rel).resolve()
             if WEB.resolve() not in target.parents or not target.is_file():
                 return self._send(404, {"error": "not found"})

@@ -905,13 +905,16 @@
   }
 
   // Every piece of knowledge links back to where it was said: a sentence picked
-  // in the chat goes back to that sentence, an imported document to its line.
+  // in a chat goes back to that sentence (in dsh, or in the Codex page beside
+  // this board), an imported document to its line.
   function jump(o) {
     if (!o) return;
-    if (o.dsh_message) {
-      if (!EMBEDDED) return say("这句原文在 dsh 的会话里，在 dsh 中打开这个白板时点它会直接跳过去。");
-      window.parent.postMessage({ source: "km-app", type: "goto", session: o.dsh_session, message: o.dsh_message,
-                                  turn: o.dsh_turn, index: o.index, text: o.text }, "*");
+    const agent = o.agent || (o.dsh_message ? "dsh" : "");
+    if (agent && o.message) {
+      if (!EMBEDDED) return say("这句原文在左边的对话里，在这个白板嵌在那个对话里时点它会直接跳过去。");
+      window.parent.postMessage({ source: "km-app", type: "goto", agent, session: o.session || o.dsh_session,
+                                  message: o.message || o.dsh_message, turn: o.turn != null ? o.turn : o.dsh_turn,
+                                  index: o.index, text: o.text }, "*");
       say("正在左边定位到这句原文…", true);
       return;
     }
