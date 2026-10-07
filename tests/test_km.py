@@ -255,6 +255,16 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(merged["text"], "第一句。第二句。")
         self.assertEqual(self.s.card(card["id"])["origins"][0]["unit"], a["id"])
 
+    def test_several_sentences_make_one_card_with_every_origin(self):
+        # 框选多句 = 一张卡：正文是这几句，出处一条不少
+        picked = [u["id"] for u in self.units[2:5]]
+        body = "\n\n".join(u["text"] for u in self.units[2:5])
+        card = self.s.create_card("", body, picked)
+        self.assertEqual([o["unit"] for o in card["origins"]], picked)
+        self.assertEqual(len(card["body"].split("\n\n")), len(picked))
+        self.assertEqual([u["status"] for u in self.s.units(self.sid) if u["id"] in picked], ["kept"] * len(picked))
+        self.assertEqual([n for n in self.s.canvas()["nodes"] if n != self.s.root], [card["id"]])
+
     def test_cards_links_and_graph(self):
         c1 = self.s.create_card("", "梯度 $\\nabla$", [self.units[2]["id"]])
         c2 = self.s.create_card("主题", "优化", [])

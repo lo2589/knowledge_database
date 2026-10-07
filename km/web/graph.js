@@ -1351,7 +1351,7 @@
       box.style.height = Math.abs(ev.clientY - y0) + "px";
     };
     draw(down);
-    say("框里的卡片会合成一张；框里的资料句子会各成一张卡", true);
+    say("框里的一切会合成一张卡", true);
     const move = (ev) => {
       if (Math.hypot(ev.clientX - x0, ev.clientY - y0) > 6) moved = true;
       draw(ev);
@@ -1379,9 +1379,7 @@
       const units = [...$("layer").querySelectorAll(".source .sent:not(.picked)")].filter(hits)
         .map(el => ({ uid: +el.dataset.unit, sid: +el.dataset.srcid }));
       if (!inside.length && !units.length) return say("框里没有卡片，也没有资料句子");
-      if (units.length) return blockFromUnits(units, inside);
-      if (inside.length < 2) return say("框里只有一张卡，至少框两张才能合成一张");
-      mergeBlock(inside);
+      blockFromBox(units, inside);
     };
     document.addEventListener("pointermove", move);
     document.addEventListener("pointerup", up);
@@ -1401,29 +1399,36 @@
     } catch (e) { fail(e); return null; }
   }
 
-  // Sentences box-selected on the canvas (the sentences of an imported document):
-  // each becomes its own card under the mount point — one gesture instead of
-  // clicking through a whole page of text.
-  async function blockFromUnits(units, cards) {
-    const made = [];
+  // A box is one card. What it holds becomes that card: the sentences of an
+  // imported document become its text (each keeping its own origin), and any
+  // card in the same box is merged into it. A box of nothing but cards merges
+  // them the way it always did.
+  async function blockFromBox(units, cards) {
+    const texts = [], uids = [];
+    for (const { uid, sid } of units) {
+      const u = (S.units.get(sid) || []).find(x => x.id === uid);
+      if (u) { texts.push(u.text); uids.push(uid); }
+    }
     try {
-      say(`框里 ${units.length} 句，正在各做一张卡…`, true);
-      for (const { uid, sid } of units) {
-        const u = (S.units.get(sid) || []).find(x => x.id === uid);
-        if (!u) continue;
-        made.push((await api("POST", "cards", { title: "", body: u.text, units: [uid], parent: S.data.target })).id);
+      let keep = null;
+      if (uids.length) {
+        say(`正在把框里的 ${uids.length} 句合成一张卡…`, true);
+        keep = (await api("POST", "cards", { title: "", body: texts.join("\n\n"), units: uids, parent: S.data.target })).id;
+        for (const sid of new Set(units.map(u => u.sid))) {
+          S.units.set(sid, await api("GET", `sources/${sid}/units`).catch(() => []));
+        }
+        for (const cid of cards) await api("POST", "cards/merge", { source: cid, target: keep });
+        await reload(keep);
+        say(`框里的 ${uids.length} 句合成了一张卡` + (cards.length ? `，另外 ${cards.length} 张卡也并了进去` : ""), true);
+      } else {
+        if (cards.length < 2) return say("框里只有一张卡，至少框两张才能合成一张");
+        keep = await mergeBlock(cards, true);
+        if (keep == null) return;
+        say(`${cards.length} 张卡合成了一张`, true);
       }
-      for (const sid of new Set(units.map(u => u.sid))) {
-        S.units.set(sid, await api("GET", `sources/${sid}/units`).catch(() => []));
-      }
-      if (cards.length > 1) {
-        const keep = await mergeBlock(cards, true);
-        say(`${made.length} 句各成一张卡，框里的 ${cards.length} 张卡合成了一张${keep ? "「" + node(keep).title + "」" : ""}`, true);
-        return;
-      }
-      await reload(made.length ? made[0] : undefined);
-      say(made.length ? `${made.length} 句各成一张卡，挂在「${node(S.data.target).title}」下面` : "框里的句子都已经是卡片了", true);
-      if (made.length) { center(made[0]); flash(made[0]); }
+      S.selected = keep;
+      center(keep);
+      flash(keep);
     } catch (e) { fail(e); }
   }
 

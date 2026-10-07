@@ -550,8 +550,8 @@ window.__ModuleLoader__.load({
             el.appendChild(b)
             return b
           }
-          add('各做一张卡', '每句各成一张卡，挂在当前挂载点下', () => run(false))
-          add('合成一张卡', '这些句子合成一张卡，正文按顺序连起来，每句的出处都留着', () => run(true))
+          // 框选出来的一段话就是一张卡：多选不是「多张卡」，是这一块知识。
+          add('合成一张卡', '框住的句子合成一张卡，正文按顺序连起来，每句的出处都留着', () => run(true))
           add('取消', '清空选择（Esc 也行）', closeBar)
           document.body.appendChild(el)
         }

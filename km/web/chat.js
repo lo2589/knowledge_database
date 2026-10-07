@@ -394,8 +394,8 @@
       const bar = document.createElement("div");
       bar.className = "km-multi-bar";
       const t = document.createElement("b"); t.textContent = `选了 ${n} 句`; bar.appendChild(t);
-      [["各做一张卡", "每句各成一张卡", () => run(false)],
-       ["合成一张卡", "合成一张，正文按顺序连起来，每句的出处都留着", () => run(true)],
+      // A box of sentences is one card: that is what selecting a passage means.
+      [["合成一张卡", "框住的句子合成一张，正文按顺序连起来，每句的出处都留着", () => run(true)],
        ["取消", "清空选择（Esc 也行）", closeBar]].forEach(([label, hint, fn]) => {
         const b = document.createElement("button");
         b.textContent = label; b.title = hint; b.onclick = fn; bar.appendChild(b);
