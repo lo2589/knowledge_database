@@ -21,7 +21,7 @@ import time
 import fastnode
 
 from .importers import Document
-from .split import LABELLED_ITEM, split_markdown, split_sentences
+from .split import LABELLED_ITEM, Unit, split_markdown, split_sentences
 
 RELATIONS = {
     "belongs_to": "属于",      # A 属于 B：B 是 A 的上一级。每张卡最多一个上级，组成层级树
@@ -102,6 +102,7 @@ class KnowledgeStore:
 
     def _migrate_structured_units(self) -> None:
         """Split old tables and inline records, preserving existing card origins."""
+        self._restore_whole_tables()
         for kind in ("table", "sentence"):
             old = self.db.query({"predicate": {"op": "and", "args": [
                 {"op": "eq", "field": "@type", "value": "unit"},
@@ -110,13 +111,47 @@ class KnowledgeStore:
             for unit in old:
                 self._migrate_structured_unit(unit, kind)
 
+    def _restore_whole_tables(self) -> None:
+        """A table split up before this version lost its whole-table unit.
+
+        The whole table is still there — it is the record the old migration kept
+        as 「旧卡所引原文」 — so a library from before gets its three levels back:
+        that record becomes the table unit again, and the rows it never had are
+        added beside the fields it already has.
+        """
+        legacy = self.db.query({"predicate": {"op": "eq", "field": "/kind", "value": "table_legacy"},
+                                "include_data": True, "limit": 100000})["nodes"]
+        for unit in legacy:
+            attrs = unit["attrs"]
+            pieces = [p for p in split_markdown(attrs["text"]) if p.kind in ("table_row", "table_item")]
+            if not pieces:
+                continue
+            group = max([u["attrs"].get("group") or 0 for u in
+                         self.db.query({"predicate": {"op": "eq", "field": "/source", "value": attrs["source"]},
+                                        "include_data": True, "limit": 100000})["nodes"]] + [0])
+            group += 1
+            have = {u["attrs"].get("text") for u in
+                    self.db.query({"predicate": {"op": "eq", "field": "/source", "value": attrs["source"]},
+                                   "include_data": True, "limit": 100000})["nodes"]}
+            for index, piece in enumerate(pieces, 1):
+                if piece.text in have:
+                    continue          # the fields of this table are already there
+                uid = self.db.create({"type": "unit", "summary": plain(piece.text),
+                                      "attrs": {**attrs, "kind": piece.kind, "text": piece.text,
+                                                "group": group, "row": piece.row, "col": piece.col,
+                                                "status": "new"}})
+                self.db.link(uid, "in_source", attrs["source"])
+            self.db.patch(unit["id"], {"attrs": {"kind": "table", "split": 2, "group": group, "status": "kept"}})
+
     def _migrate_structured_unit(self, unit: dict, kind: str) -> None:
         attrs = unit["attrs"]
+        if attrs.get("split") == 2:
+            return                      # already in the three-level table shape
         if kind == "table":
-            pieces = [p for p in split_markdown(attrs["text"]) if p.kind == "table_item"]
+            pieces = [p for p in split_markdown(attrs["text"]) if p.kind in ("table_row", "table_item")]
         else:
             sentences = split_sentences(attrs["text"])
-            if sum(bool(LABELLED_ITEM.match(s)) for s in sentences) < 2:
+            if sum(bool(LABELLED_ITEM.match(x)) for x in sentences) < 2:
                 return
             pieces = [p for p in split_markdown(attrs["text"]) if p.kind == "sentence"]
         if not pieces:
@@ -126,9 +161,14 @@ class KnowledgeStore:
             order = attrs["order"] + index / (len(pieces) + 1)
             uid = self.db.create({"type": "unit", "summary": plain(piece.text),
                                   "attrs": {**attrs, "order": order, "kind": piece.kind,
-                                            "text": piece.text, "status": "new"}})
+                                            "text": piece.text, "group": piece.group,
+                                            "row": piece.row, "col": piece.col, "status": "new"}})
             self.db.link(uid, "in_source", attrs["source"])
-        if linked:
+        if kind == "table":
+            # The record that held the whole table stays as that: the unit you
+            # take when you want the comparison, and the one old cards point at.
+            self.db.patch(unit["id"], {"attrs": {"kind": "table", "split": 2, "status": "kept"}})
+        elif linked:
             self.db.patch(unit["id"], {"attrs": {"kind": kind + "_legacy", "status": "kept"}})
         else:
             self.db.delete(unit["id"])
@@ -146,19 +186,19 @@ class KnowledgeStore:
             nodes, order = [], 0
             for mi, msg in enumerate(doc.messages):
                 speaker = msg.get("speaker")
-                if speaker == "user":
-                    # What you asked stays whole: it is context for what follows.
-                    pieces = [("question", msg["text"].strip(), "")]
-                else:
-                    pieces = [(u.kind, u.text, u.section) for u in split_markdown(msg["text"])]
-                for kind, text, section in pieces:
-                    if not text:
+                # What you asked stays whole: it is context for what follows.
+                pieces = ([Unit("question", msg["text"].strip())] if speaker == "user"
+                          else split_markdown(msg["text"]))
+                for piece in pieces:
+                    if not piece.text:
                         continue
                     nodes.append({
                         "type": "unit",
-                        "summary": plain(text),
+                        "summary": plain(piece.text),
                         "attrs": {"source": sid, "order": order, "message": mi, "speaker": speaker,
-                                  "kind": kind, "text": text, "section": section, "status": "new"},
+                                  "kind": piece.kind, "text": piece.text, "section": piece.section,
+                                  "group": piece.group, "row": piece.row, "col": piece.col,
+                                  "status": "new"},
                     })
                     order += 1
             ids = self.db.create_many(nodes) if nodes else []

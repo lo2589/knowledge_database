@@ -129,7 +129,8 @@ class Api:
         # transcripts. Nothing else may run without a session.
         if parts == ["split"] and method == "POST":
             from .split import split_markdown
-            return [{"kind": u.kind, "text": u.text} for u in split_markdown(str(body.get("text", "")))]
+            return [{"kind": u.kind, "text": u.text, "group": u.group, "row": u.row, "col": u.col}
+                    for u in split_markdown(str(body.get("text", "")))]
         if parts == ["claude-sessions"]:
             return list_claude_sessions(self.claude_root)
 

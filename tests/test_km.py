@@ -55,27 +55,42 @@ class SplitTests(unittest.TestCase):
 
     def test_blocks_stay_whole(self):
         doc = "前言。\n\n$$\na = b.\nc = d.\n$$\n\n| a | b |\n|---|---|\n| 1. | 2. |\n\n```py\nx = 1. ; y = 2.\n```\n\n\\begin{align}\na &= b\n\\end{align}"
-        self.assertEqual([k for k, _ in self.kinds(doc)], ["sentence", "math", "table_item", "code", "math"])
+        # 表格：整张表 + 每一行（两列的表，行就是格，不重复存）
+        self.assertEqual([k for k, _ in self.kinds(doc)],
+                         ["sentence", "math", "table", "table_row", "code", "math"])
 
     def test_table_fields_are_independent_with_row_and_column_context(self):
         table = "| 模型 | 价格 | 上下文 |\n|:---|---:|---|\n| A | $5 | 8K |\n| B | — | 32K |"
         self.assertEqual(self.kinds(table), [
+            # 整张表：要对比就整张拿走
+            ("table", "| 模型 | 价格 | 上下文 |\n|---|---|---|\n| A | $5 | 8K |\n| B | — | 32K |"),
+            # 一行：带上列名，单独成卡也读得懂
+            ("table_row", "模型：A · 价格：$5 · 上下文：8K"),
+            ("table_row", "模型：B · 上下文：32K"),
+            # 一格：只要这一个数据（B 那行只有一个值，行已经等于格，不重复）
             ("table_item", "模型：A · 价格：$5"),
             ("table_item", "模型：A · 上下文：8K"),
-            ("table_item", "模型：B · 上下文：32K"),
         ])
+        units = split_markdown(table)
+        self.assertEqual([(u.row, u.col) for u in units if u.kind == "table_item"], [(1, 1), (1, 2)])
+        self.assertEqual([(u.group, u.row) for u in units if u.kind == "table_row"], [(1, 1), (1, 2)])
+        self.assertEqual({u.group for u in units}, {1})
 
     def test_table_without_outer_pipes_and_protected_pipes(self):
         table = "字段 | 值\n--- | ---\n公式 | $|x|$\n代码 | `a|b`\n转义 | a\\|b"
+        # 两列的表：一行就一个数据，所以行即是格，不会存两份
         self.assertEqual([t for _, t in self.kinds(table)], [
+            "| 字段 | 值 |\n|---|---|\n| 公式 | $|x|$ |\n| 代码 | `a|b` |\n| 转义 | a\\|b |",
             "字段：公式 · 值：$|x|$",
             "字段：代码 · 值：`a|b`",
             "字段：转义 · 值：a\\|b",
         ])
 
     def test_one_column_table_is_one_unit_per_row(self):
+        # 单列表格：一行就是一个单位，不再重复拆成一格
         self.assertEqual(self.kinds("| 事项 |\n|---|\n| 一 |\n| 二 |"),
-                         [("table_item", "一"), ("table_item", "二")])
+                         [("table", "| 事项 |\n|---|\n| 一 |\n| 二 |"),
+                          ("table_row", "一"), ("table_row", "二")])
 
     def test_math_fence_is_math(self):
         self.assertEqual(self.kinds("```math\nx^2\n```")[0][0], "math")
@@ -145,7 +160,8 @@ class ImporterTests(unittest.TestCase):
     def test_html_table_without_header_keeps_first_record(self):
         md = html_to_markdown("<table><tr><td>A</td><td>5</td></tr><tr><td>B</td><td>8</td></tr></table>")
         self.assertEqual([u.text for u in split_markdown(md)],
-                         ["列1：A · 列2：5", "列1：B · 列2：8"])
+                         ["| 列1 | 列2 |\n|---|---|\n| A | 5 |\n| B | 8 |",
+                          "列1：A · 列2：5", "列1：B · 列2：8"])
 
 
 class StoreTests(unittest.TestCase):
@@ -164,9 +180,20 @@ class StoreTests(unittest.TestCase):
     def test_table_import_keeps_only_selected_datum_in_card(self):
         sid = self.s.add_document(load_text("| 模型 | 价格 | 上下文 |\n|---|---|---|\n| A | $5 | 8K |", "表"))["id"]
         units = self.s.units(sid)
-        self.assertEqual([u["text"] for u in units], ["模型：A · 价格：$5", "模型：A · 上下文：8K"])
-        card = self.s.create_card("", units[0]["text"], [units[0]["id"]])
+        self.assertEqual([(u["kind"], u["text"]) for u in units], [
+            ("table", "| 模型 | 价格 | 上下文 |\n|---|---|---|\n| A | $5 | 8K |"),
+            ("table_row", "模型：A · 价格：$5 · 上下文：8K"),
+            ("table_item", "模型：A · 价格：$5"),
+            ("table_item", "模型：A · 上下文：8K"),
+        ])
+        datum = [u for u in units if u["kind"] == "table_item"][0]
+        card = self.s.create_card("", datum["text"], [datum["id"]])
         self.assertNotIn("8K", card["body"])
+        # 整张表也能单独做一张卡
+        whole = [u for u in units if u["kind"] == "table"][0]
+        big = self.s.create_card("", whole["text"], [whole["id"]])
+        self.assertIn("8K", big["body"])
+        self.assertEqual([u["group"] for u in units], [1, 1, 1, 1])
 
     def test_existing_whole_table_is_split_without_losing_card_origin(self):
         sid = self.s.add_document(load_text("引言。", "旧资料"))["id"]
@@ -180,11 +207,15 @@ class StoreTests(unittest.TestCase):
             self.s._migrate_structured_units()
             self.s._migrate_structured_units()
         units = self.s.units(sid)
-        self.assertEqual([u["kind"] for u in units], ["sentence", "table_legacy", "table_item", "table_item"])
-        self.assertEqual([u["text"] for u in units[2:]], ["模型：A · 价格：$5", "模型：A · 上下文：8K"])
-        self.assertEqual(self.s.card(card["id"])["origins"][0]["unit"], uid)
-        self.assertEqual(self.s.sources()[0]["counts"], {"new": 3, "kept": 0, "dropped": 0})
-        self.assertEqual(self.s.stats()["units"], len(self.units) + 3)
+        # 老的整体表格单元留下来当「整张表」，另外补出一行和每一格
+        self.assertEqual([u["kind"] for u in units], ["sentence", "table", "table_row", "table_item", "table_item"])
+        self.assertEqual([u["text"] for u in units[2:]], ["模型：A · 价格：$5 · 上下文：8K",
+                                                          "模型：A · 价格：$5", "模型：A · 上下文：8K"])
+        self.assertEqual(units[1]["id"], uid)
+        self.assertEqual(units[1]["split"], 2)
+        self.assertEqual(self.s.card(card["id"])["origins"][0]["unit"], uid)   # 老卡还在指着整张表
+        self.assertEqual(self.s.sources()[0]["counts"], {"new": 4, "kept": 1, "dropped": 0})
+        self.assertEqual(self.s.stats()["units"], len(self.units) + 5)
 
     def test_existing_inline_records_are_split_without_losing_card_origin(self):
         sid = self.s.add_document(load_text("引言。", "旧资料"))["id"]

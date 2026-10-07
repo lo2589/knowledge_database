@@ -57,6 +57,12 @@ window.__ModuleLoader__.load({
       '@keyframes kmflash{0%,45%{background:rgba(242,201,76,.55);box-shadow:0 0 0 2px #f2c94c}100%{background:transparent}}',
       '.km-s .km-tag{position:absolute;right:6px;top:2px;font-size:11px;color:#1f7a4a;background:rgba(255,255,255,.85);border-radius:4px;padding:0 4px}',
       '.km-s > div p:last-child{margin-bottom:0}',
+      '.km-s.tbl{cursor:default}',
+      '.km-s.tbl table{font-size:12.5px;margin:3px 0}',
+      '.km-s.tbl tbody tr{cursor:pointer}',
+      '.km-s.tbl tbody tr:hover{background:rgba(47,91,211,.07)}',
+      '.km-s.tbl tr.picked > td{background:rgba(31,122,74,.10)}',
+      '.km-s.tbl td.picked{background:rgba(31,122,74,.20)}',
       '.km-user-row{display:flex;flex-direction:column;align-items:flex-end;gap:6px}',
       '.km-user-ans{max-width:min(calc(var(--dsh-chat-content-width,748px) * .702),82%);background:var(--dsw-specific-bubble,#edf0f4);border-radius:18px;padding:7px 10px}',
       '.km-user-ans .km-s{margin-left:0;padding:3px 8px;border-radius:5px}',
@@ -309,13 +315,89 @@ window.__ModuleLoader__.load({
       return state
     }
 
+    // 一张表三层：整张表 / 一行 / 一格。行和格在表里点，不再各占一行。
+    function TableBlock({ unit, units, picked, onPick }) {
+      const ref = React.useRef(null)
+      const find = (kind, row, col) => units.find((x) => x.kind === kind && x.group === unit.group
+        && x.row === row && (col == null || x.col === col))
+      // 已经入库的那一行/那一格标出来（点完立刻标，刷新后也从 picked 里认出来）
+      React.useEffect(() => {
+        const table = ref.current && ref.current.querySelector('table')
+        if (!table) return
+        Array.from(table.querySelectorAll('tbody tr')).forEach((tr, r) => {
+          tr.dataset.row = String(r + 1)
+          const rowUnit = find('table_row', r + 1)
+          tr.classList.toggle('picked', !!(rowUnit && picked[rowUnit.text]))
+          Array.from(tr.children).forEach((td, c) => {
+            td.dataset.col = String(c)
+            const item = find('table_item', r + 1, c)
+            td.classList.toggle('picked', !!(item && picked[item.text]))
+          })
+        })
+      })
+      const take = (e, asRow) => {
+        const cell = e.target.closest('td'), tr = e.target.closest('tbody tr')
+        if (cell && e.altKey && !asRow) {
+          const item = find('table_item', Number(cell.closest('tr').dataset.row), Number(cell.dataset.col))
+          if (item) return [item, cell]
+        }
+        if (tr && (asRow || e.ctrlKey || e.metaKey)) {
+          const rowUnit = find('table_row', Number(tr.dataset.row))
+          if (rowUnit) return [rowUnit, tr]
+        }
+        return [unit, null]
+      }
+      const fire = (e, asRow) => {
+        if (e.target.closest('a')) return
+        e.preventDefault()
+        if (asRow) e.stopPropagation()
+        const [want, marker] = take(e, asRow)
+        onPick(want, marker)
+      }
+      return h('div', {
+        ref,
+        className: 'km-s tbl',
+        'data-km-msg': unit.messageId, 'data-km-idx': unit.index, 'data-km-text': unit.text,
+        title: '点：整张表做成卡片 · Ctrl（Mac 上 Ctrl=右键，或 ⌘）点某一行：只取那一行 · ⌥ 点某一格：只取那一个数据',
+        onClick: (e) => fire(e, false),
+        // Mac 上 Ctrl+点就是右键：那一行照样单独取，不给浏览器菜单
+        onContextMenu: (e) => fire(e, true),
+      }, h(MarkdownText, { text: unit.text, streaming: false, labels: LABELS }),
+        picked[unit.text] ? h('span', { className: 'km-tag' }, '✓ 已入库') : null)
+    }
+
     function SentenceBlock({ text, base, messageId, sessionId, turn, picked, speaker = 'assistant' }) {
       const units = useSentences(text)
       const [busy, setBusy] = React.useState(-1)
       if (!units) return h(MarkdownText, { text, streaming: false, labels: LABELS })
+      const tables = new Map()
+      units.forEach((u) => { if (u.kind === 'table') tables.set(u.group, u) })
+      const inTable = (u) => (u.kind === 'table_row' || u.kind === 'table_item') && tables.has(u.group)
+      const pickText = async (u, index, marker) => {
+        const cards = Object.prototype.hasOwnProperty.call(picked, u.text) ? picked[u.text] : null
+        if (cards) { bus.post({ type: 'focus', card: cards[cards.length - 1] }); return toast('已经在右边那张卡上了') }
+        if (marker) marker.classList.add('busy'); else setBusy(index)
+        try {
+          const r = await fetch('/plugins/known-manage/pick', { method: 'POST', headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ sessionId, messageId, index, text: u.text, speaker, turn }) })
+          const out = await r.json()
+          if (!out.ok) throw new Error(out.error)
+          bus.set({ pickedVersion: bus.pickedVersion + 1 })
+          bus.post({ type: 'refresh', card: out.card })
+          toast('挂上了：' + out.title)
+        } catch (err) { toast('没挂上：' + err.message) }
+        finally { if (marker) marker.classList.remove('busy'); else setBusy(-1) }
+      }
       return h('div', { className: 'km-ans' + (speaker === 'user' ? ' km-user-ans' : '') }, units.map((u, i) => {
         const index = base + i
+        if (inTable(u)) return null
         const cards = Object.prototype.hasOwnProperty.call(picked, u.text) ? picked[u.text] : null
+        if (u.kind === 'table') {
+          return h(TableBlock, {
+            key: i, unit: Object.assign({}, u, { messageId, index }), units, picked,
+            onPick: (want, marker) => pickText(want, index, marker),
+          })
+        }
         return h('div', {
           key: i, className: 'km-s' + (cards ? ' picked' : '') + (busy === index ? ' busy' : ''),
           'data-km-msg': messageId, 'data-km-idx': index, 'data-km-turn': turn == null ? undefined : turn,
@@ -324,21 +406,7 @@ window.__ModuleLoader__.load({
           // card is the sentence itself and not whatever the Markdown rendered to.
           'data-km-text': u.text, 'data-km-speaker': speaker,
           title: cards ? '已入库：点一下在右边看这张卡' : '点一下：放进右边知识图的挂载点下',
-          onClick: async (e) => {
-            if (e.target.closest('a, button')) return
-            if (cards) { bus.post({ type: 'focus', card: cards[cards.length - 1] }); return }
-            setBusy(index)
-            try {
-              const r = await fetch('/plugins/known-manage/pick', { method: 'POST', headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ sessionId, messageId, index, text: u.text, speaker, turn }) })
-              const out = await r.json()
-              if (!out.ok) throw new Error(out.error)
-              bus.set({ pickedVersion: bus.pickedVersion + 1 })
-              bus.post({ type: 'refresh', card: out.card })
-              toast('挂上了：' + out.title)
-            } catch (err) { toast('没挂上：' + err.message) }
-            finally { setBusy(-1) }
-          },
+          onClick: (e) => { if (!e.target.closest('a, button')) pickText(u, index, null) },
         }, h(MarkdownText, { text: u.text, streaming: false, labels: LABELS }), cards ? h('span', { className: 'km-tag' }, '✓ 已入库') : null)
       }))
     }

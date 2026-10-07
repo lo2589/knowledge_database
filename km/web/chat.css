@@ -67,6 +67,14 @@ input:focus, textarea:focus { outline: 2px solid var(--accent-soft); border-colo
                 background: rgba(255,255,255,.85); border-radius: 4px; padding: 0 4px; }
 .km-s > div p:last-child { margin-bottom: 0; }
 .q .km-s { margin-left: 0; padding: 3px 8px; border-radius: 5px; }
+/* 一张表：点整张、Ctrl 点一行、⌥ 点一格 */
+.km-s.tbl { cursor: default; }
+.km-s.tbl table { font-size: 12.5px; margin: 3px 0; }
+.km-s.tbl tbody tr { cursor: pointer; }
+.km-s.tbl tbody tr:hover { background: var(--accent-soft); }
+.km-s.tbl tr.picked > td { background: rgba(31,122,74,.10); }
+.km-s.tbl td.picked { background: rgba(31,122,74,.20); }
+.km-s.tbl .km-tag { top: 2px; }
 
 #composer { border-top: 1px solid var(--line); background: var(--panel); padding: 8px 12px 10px; }
 #ask { width: 100%; min-height: 42px; max-height: 30vh; resize: vertical; }

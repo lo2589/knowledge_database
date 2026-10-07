@@ -322,18 +322,60 @@
     return `<div class="relation-composer"><select data-relkind="${id}">${Object.entries(REL).filter(([k]) => k !== "mentions").map(([k, v]) => `<option value="${k}">${k === "belongs_to" ? "属于" : v}</option>`).join("")}</select><input data-relq="${id}" value="${esc(q)}" placeholder="输入卡片标题"><div class="cands" data-cands="${id}"></div></div>`;
   }
 
+  // 一份资料里，哪些单位是一张表的三层：整张表(table)、某一行(table_row)、某一格(table_item)。
+  // 表按表画，行和格不再各占一行——它们在那张表里点得到。
+  function tablePlan(units) {
+    const tables = new Map();      // group → 整张表那个单位
+    units.forEach(u => { if (u.kind === "table" && u.group != null) tables.set(u.group, u); });
+    const inside = new Set();      // 已经画在表里的行/格
+    units.forEach(u => {
+      if ((u.kind === "table_row" || u.kind === "table_item") && u.group != null && tables.has(u.group)) inside.add(u.id);
+    });
+    return { tables, inside };
+  }
+
   function sourceHtml(src) {
     const units = S.units.get(src.id);
     let h = `<div class="source" data-src="${src.id}" style="width:${SOURCE_W}px">
       <div class="nh"><span class="ttl">${esc(src.title)}</span>
         <button class="bodytog" data-srcdel="${src.id}" title="删掉这份资料：用它做的卡片一起删">×</button></div>`;
-      if (!units) h += `<div class="sent">读取中…</div>`;
-      else {
-        h += units.filter(u => u.kind !== "heading" && !u.kind.endsWith("_legacy")).map(u => `<div class="sent ${u.cards.length ? "picked" : ""}" data-unit="${u.id}" data-srcid="${src.id}" title="点一下：做成卡片，挂到挂载点下">
-          <div class="md" data-sent="${u.id}"></div>${u.cards.length ? `<span class="tag">✓ 已成卡</span>` : ""}</div>`).join("");
-        h += units.filter(u => u.kind.endsWith("_legacy")).map(u => `<div class="legacy" data-legacy="${u.id}"><b>旧卡所引原文</b><div class="md" data-sent="${u.id}"></div></div>`).join("");
-      }
+    if (!units) h += `<div class="sent">读取中…</div>`;
+    else {
+      const plan = tablePlan(units);
+      const lines = units.filter(u => u.kind !== "heading" && !u.kind.endsWith("_legacy") && !plan.inside.has(u.id));
+      h += lines.map(u => u.kind === "table"
+        ? `<div class="sent tbl ${u.cards.length ? "picked" : ""}" data-tbl="${u.id}" data-srcid="${src.id}"
+             title="点一下：整张表做成一张卡 · Ctrl 点某一行：只取那一行 · ⌥ 点某一格：只取那一个数据">
+             <div class="md" data-tblmd="${u.id}"></div><div class="tbl-hint">整张表 · Ctrl+点一行 · ⌥+点一格</div></div>`
+        : `<div class="sent ${u.cards.length ? "picked" : ""}" data-unit="${u.id}" data-srcid="${src.id}" title="点一下：做成卡片，挂到挂载点下">
+             <div class="md" data-sent="${u.id}"></div>${u.cards.length ? `<span class="tag">✓ 已成卡</span>` : ""}</div>`).join("");
+      h += units.filter(u => u.kind.endsWith("_legacy")).map(u => `<div class="legacy" data-legacy="${u.id}"><b>旧卡所引原文</b><div class="md" data-sent="${u.id}"></div></div>`).join("");
+    }
     return h + `</div>`;
+  }
+
+  // 把渲染出来的表标上行列，并把已经成卡的行/格标出来：点哪儿取哪层。
+  function markTables(src) {
+    const units = S.units.get(src.id) || [];
+    const plan = tablePlan(units);
+    plan.tables.forEach((table, group) => {
+      const host = $("layer").querySelector(`[data-tblmd="${table.id}"]`);
+      const el = host && host.querySelector("table");
+      if (!el) return;
+      const rows = [...el.querySelectorAll("tbody tr")];
+      const byKey = (kind, row, col) => units.find(u => u.kind === kind && u.group === group
+        && u.row === row && (col == null || u.col === col));
+      rows.forEach((tr, i) => {
+        tr.dataset.row = String(i + 1);
+        const rowUnit = byKey("table_row", i + 1);
+        if (rowUnit && rowUnit.cards.length) tr.classList.add("picked");
+        [...tr.children].forEach((td, c) => {
+          td.dataset.col = String(c);
+          const item = byKey("table_item", i + 1, c);
+          if (item && item.cards.length) td.classList.add("picked");
+        });
+      });
+    });
   }
 
   function render() {
@@ -362,6 +404,10 @@
       const pre = layer.querySelector(`[data-pre="${id}"]`); if (pre) mount(pre, n.body);
     });
     srcs.forEach(s => (S.units.get(s.id) || []).forEach(u => { const el = layer.querySelector(`[data-sent="${u.id}"]`); if (el) mount(el, u.text); }));
+    srcs.forEach(s => {
+      (S.units.get(s.id) || []).forEach(u => { const el = layer.querySelector(`[data-tblmd="${u.id}"]`); if (el) mount(el, u.text); });
+      markTables(s);
+    });
 
     // Measured before layout: a card is as wide as its widest display formula
     // needs, so nothing is ever cut off on the card face. The formula itself is
@@ -763,15 +809,50 @@
         say(out.cards ? `资料和用它做的 ${out.cards} 张卡都删了` : "资料删了，没有卡片用它", true);
       }, null);
     });
-    on("[data-unit]", "click", el => {
-      const uid = +el.dataset.unit, sid = +el.dataset.srcid, u = S.units.get(sid).find(x => x.id === uid);
-      S.lastNew = null;
-      act(async () => {
-        const c = await api("POST", "cards", { title: "", body: u.text, units: [uid], parent: S.data.target });
-        S.units.set(sid, await api("GET", `sources/${sid}/units`));
-        S.lastNew = c.id;
-      }, "挂上了", null).then(ok => { if (ok && S.lastNew) { render(); center(S.lastNew); flash(S.lastNew); } });
+    // 一张表三层：直接点它 = 整张表；Ctrl（Mac 上是 Ctrl=右键，或 ⌘）点某一行 = 那一行；
+    // ⌥ 点某一格 = 那一个数据。
+    const tablePick = (host, e, asRow) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const units = S.units.get(+host.dataset.srcid) || [];
+      const table = units.find(u => u.id === +host.dataset.tbl);
+      if (!table) return;
+      const cell = e.target.closest("td"), row = e.target.closest("tbody tr");
+      const wanted = [];
+      if (cell && e.altKey && !asRow) {
+        const n = Number(cell.closest("tr").dataset.row), c = Number(cell.dataset.col);
+        wanted.push(units.find(u => u.kind === "table_item" && u.group === table.group && u.row === n && u.col === c));
+      }
+      if (row && (asRow || e.ctrlKey || e.metaKey)) {
+        const n = Number(row.dataset.row);
+        wanted.push(units.find(u => u.kind === "table_row" && u.group === table.group && u.row === n));
+      }
+      wanted.push(table);
+      const unit = wanted.find(Boolean);
+      if (unit) pickUnit(unit, +host.dataset.srcid);
+    };
+    layer.querySelectorAll("[data-tbl]").forEach(host => {
+      host.addEventListener("click", e => tablePick(host, e, false));
+      // Mac 上 Ctrl+点就是右键：那一行照样是「单独取这一行」，不给浏览器菜单。
+      host.addEventListener("contextmenu", e => tablePick(host, e, true));
     });
+    on("[data-unit]", "click", el => {
+      const unit = S.units.get(+el.dataset.srcid).find(x => x.id === +el.dataset.unit);
+      if (unit) pickUnit(unit, +el.dataset.srcid);
+    });
+  }
+
+  // A unit of an imported document becomes a card under the mount point. Sentences,
+  // whole tables, single rows and single cells all go through here.
+  async function pickUnit(unit, sid) {
+    S.lastNew = null;
+    const ok = await act(async () => {
+      const c = await api("POST", "cards", { title: "", body: unit.text, units: [unit.id], parent: S.data.target });
+      S.units.set(sid, await api("GET", `sources/${sid}/units`).catch(() => []));
+      S.lastNew = c.id;
+    }, unit.kind === "table" ? "整张表做成了一张卡" : unit.kind === "table_row" ? "这一行做成了一张卡"
+       : unit.kind === "table_item" ? "这一个数据做成了一张卡" : "挂上了", null);
+    if (ok && S.lastNew) { render(); center(S.lastNew); flash(S.lastNew); }
   }
 
   // One end is the card whose ＋ was pressed; the other end is the card clicked

@@ -1,8 +1,12 @@
 """Cut Markdown into information units.
 
 Block-level things that only make sense whole -- code, display math, images,
-raw HTML -- stay one unit each. Tables become one unit per populated data
-field, labelled with its row and column. Consecutive labelled records in prose
+raw HTML -- stay one unit each. A table is cut three ways so it can be taken at
+the scale you mean: the whole table as one unit, one unit per row (with the
+column names, so a row reads on its own), and one unit per populated field
+labelled with its row and column. Which units belong together is kept in
+group/row/col, so a page can let you click the table, Ctrl-click a row, or
+Option-click a cell. Consecutive labelled records in prose
 also become separate units; other prose is cut into sentences. Inside prose,
 spans whose punctuation must not end a
 sentence (inline code, inline math, links, URLs, decimals, file names,
@@ -17,9 +21,13 @@ from dataclasses import dataclass
 
 @dataclass
 class Unit:
-    kind: str  # heading | sentence | code | math | table_item | image | html
+    kind: str  # heading | sentence | code | math | table | table_row | table_item | image | html
     text: str  # Markdown source of this unit, renderable on its own
     section: str = ""  # nearest heading above, for context
+    # Which table this unit belongs to, and where inside it — None outside tables.
+    group: int | None = None
+    row: int | None = None
+    col: int | None = None
 
 
 FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})(.*)$")
@@ -37,12 +45,14 @@ def split_markdown(text: str) -> list[Unit]:
     lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     units: list[Unit] = []
     section = ""
+    table_no = 0
     i, n = 0, len(lines)
 
-    def add(kind: str, body: str) -> None:
+    def add(kind: str, body: str, group: int | None = None, row: int | None = None,
+            col: int | None = None) -> None:
         body = body.strip("\n")
         if body.strip():
-            units.append(Unit(kind, body, section))
+            units.append(Unit(kind, body, section, group, row, col))
 
     while i < n:
         line = lines[i]
@@ -107,8 +117,18 @@ def split_markdown(text: str) -> list[Unit]:
                     break
                 rows.append(cells)
                 j += 1
-            for item in _table_items(headers, rows):
-                add("table_item", item)
+            table_no += 1
+            # The whole table first: click it and you take the comparison as one.
+            add("table", _table_markdown(headers, rows), group=table_no)
+            for index, text in _table_rows(headers, rows):
+                add("table_row", text, group=table_no, row=index)
+            rows_text = {text for _, text in _table_rows(headers, rows)}
+            for index, column, text in _table_items(headers, rows):
+                # A two-column table has one datum per row: the row already says
+                # exactly this, so it is not stored twice.
+                if text in rows_text:
+                    continue
+                add("table_item", text, group=table_no, row=index, col=column)
             i = j
             continue
 
@@ -227,16 +247,47 @@ def _table_separator(line: str) -> bool:
     return bool(cells) and all(TABLE_SEP_CELL.fullmatch(c) for c in cells)
 
 
-def _table_items(headers: list[str], rows: list[list[str]]) -> list[str]:
-    """One selectable datum per field, with enough labels to stand alone."""
+def _table_markdown(headers: list[str], rows: list[list[str]]) -> str:
+    """The table as it was written, rebuilt so it renders as a table again."""
+    width = len(headers)
+    lines = ["| " + " | ".join(headers) + " |", "|" + "---|" * width]
+    for row in rows:
+        cells = (row + [""] * width)[:width]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines)
+
+
+def _table_rows(headers: list[str], rows: list[list[str]]) -> list[tuple[int, str]]:
+    """One unit per data row: every field with its column name, so the row stands
+    on its own once it is a card."""
     out = []
     width = len(headers)
     for index, row in enumerate(rows, 1):
         cells = row + [""] * (width - len(row))
         if width == 1:
             if cells[0]:
-                out.append(cells[0])
+                out.append((index, cells[0]))
             continue
+        parts = []
+        for column in range(width):
+            value = cells[column]
+            if not value or value in ("-", "—", "–"):
+                continue
+            name = headers[column] or f"字段{column + 1}"
+            parts.append(f"{name}：{value}" if column or len(headers) > 1 else value)
+        if parts:
+            out.append((index, " · ".join(parts)))
+    return out
+
+
+def _table_items(headers: list[str], rows: list[list[str]]) -> list[tuple[int, int, str]]:
+    """One selectable datum per field, with enough labels to stand alone."""
+    out = []
+    width = len(headers)
+    for index, row in enumerate(rows, 1):
+        cells = row + [""] * (width - len(row))
+        if width == 1:
+            continue          # a one-column table already is one unit per row
         key = cells[0] or f"第{index}条"
         key_name = headers[0] or "项目"
         for column in range(1, width):
@@ -244,7 +295,7 @@ def _table_items(headers: list[str], rows: list[list[str]]) -> list[str]:
             if not value or value in ("-", "—", "–"):
                 continue
             field = headers[column] or f"字段{column + 1}"
-            out.append(f"{key_name}：{key} · {field}：{value}")
+            out.append((index, column, f"{key_name}：{key} · {field}：{value}"))
     return out
 
 

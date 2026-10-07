@@ -221,6 +221,16 @@ input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent-soft
 .sent.picked { border-left-color: var(--keep); background: #f1f8f3; }
 .sent.flash { animation: flash 1.6s ease; }
 .sent .tag { font-size: 10.5px; color: var(--keep); margin-left: 6px; }
+/* 一张表在资料栏里画成表：点整张、Ctrl 点一行、⌥ 点一格 */
+.sent.tbl { padding: 4px 8px 5px; cursor: default; }
+.sent.tbl table { font-size: 12px; margin: 2px 0 0; }
+.sent.tbl th, .sent.tbl td { padding: 1px 6px; }
+.sent.tbl tbody tr { cursor: pointer; }
+.sent.tbl tbody tr:hover { background: var(--accent-soft); }
+.sent.tbl tr.picked > td { background: rgba(31,122,74,.10); }
+.sent.tbl td.picked { background: rgba(31,122,74,.20); }
+.tbl-hint { color: var(--muted); font-size: 10.5px; margin-top: 3px; }
+
 .legacy { margin: 4px 8px; padding: 3px 6px; color: var(--muted); font-size: 11.5px; border-top: 1px dashed var(--line); }
 .legacy b { font-weight: 600; }
 .legacy .md { margin-top: 5px; color: var(--ink); }

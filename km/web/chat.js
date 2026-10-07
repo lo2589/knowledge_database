@@ -113,6 +113,8 @@
   }
 
   // A settled message becomes sentences: each one can be clicked into a card.
+  // A table is cut three ways — the whole table, one row, one cell — and which
+  // one you get depends on where and how you click it.
   // @param box - the element that holds them (the answer area, or the bubble the
   //     question is written in).
   function paintSentences(box, index, text, speaker) {
@@ -123,55 +125,110 @@
       const host = box.querySelector(".km-ans");
       host.innerHTML = "";
       const picked = S.picked.get(id) || {};
-      (units || []).forEach((u, i) => {
+      units = units || [];
+      const tables = new Map();
+      units.forEach(u => { if (u.kind === "table") tables.set(u.group, u); });
+      const inTable = u => (u.kind === "table_row" || u.kind === "table_item") && tables.has(u.group);
+      const find = (kind, group, row, col) => units.find(u => u.kind === kind && u.group === group
+        && u.row === row && (col == null || u.col === col));
+
+      units.forEach((u, i) => {
+        if (inTable(u)) return;              // 行和格在那张表里点，不单独占一行
         const cards = Object.prototype.hasOwnProperty.call(picked, u.text) ? picked[u.text] : null;
         const row = document.createElement("div");
-        row.className = "km-s" + (cards ? " picked" : "");
+        row.className = "km-s" + (u.kind === "table" ? " tbl" : "") + (cards ? " picked" : "");
         row.dataset.kmMsg = id;
         row.dataset.kmIdx = String(i);
         row.dataset.kmText = u.text;
         row.dataset.kmSpeaker = speaker || "assistant";
-        row.title = cards ? "已入库：点一下在右边看这张卡" : "点一下：放进右边知识图的挂载点下";
+        row.title = u.kind === "table"
+          ? "点：整张表做成卡片 · Ctrl（Mac 上 Ctrl=右键，或 ⌘）点某一行：只取那一行 · ⌥ 点某一格：只取那一个数据"
+          : (cards ? "已入库：点一下在右边看这张卡" : "点一下：放进右边知识图的挂载点下");
         const body = document.createElement("div");
         body.className = "md";
         host.appendChild(row);
         row.appendChild(body);
         mountMd(body, u.text);
-        if (cards) {
-          const tag = document.createElement("span");
-          tag.className = "km-tag"; tag.textContent = "✓ 已入库";
-          row.appendChild(tag);
+        if (u.kind === "table") {
+          const el = body.querySelector("table");
+          if (el) {
+            [...el.querySelectorAll("tbody tr")].forEach((tr, r) => {
+              tr.dataset.row = String(r + 1);
+              const rowUnit = find("table_row", u.group, r + 1);
+              if (rowUnit && picked[rowUnit.text]) tr.classList.add("picked");
+              [...tr.children].forEach((td, c) => {
+                td.dataset.col = String(c);
+                const item = find("table_item", u.group, r + 1, c);
+                if (item && picked[item.text]) td.classList.add("picked");
+              });
+            });
+          }
+          const take = (e, asRow) => {
+            const cell = e.target.closest("td"), tr = e.target.closest("tbody tr");
+            const wanted = [];
+            if (cell && e.altKey && !asRow) wanted.push([find("table_item", u.group, Number(cell.closest("tr").dataset.row), Number(cell.dataset.col)), cell]);
+            if (tr && (asRow || e.ctrlKey || e.metaKey)) wanted.push([find("table_row", u.group, Number(tr.dataset.row)), tr]);
+            const hit = wanted.find(([unit]) => unit);
+            return hit || [u, row];
+          };
+          row.onclick = e => {
+            e.preventDefault();
+            const [want, marker] = take(e, false);
+            pick(row, want.text, id, i, speaker, index, want === u ? "" : "整张表 · ", marker);
+          };
+          row.oncontextmenu = e => {
+            e.preventDefault(); e.stopPropagation();
+            const [want, marker] = take(e, true);
+            pick(row, want.text, id, i, speaker, index, "", marker);
+          };
+          if (cards) {
+            const tag = document.createElement("span");
+            tag.className = "km-tag"; tag.textContent = "✓ 已入库";
+            row.appendChild(tag);
+          }
+          return;
         }
         row.onclick = () => {
           if (cards) { tellGraph({ type: "focus", card: cards[cards.length - 1] }); return toast("已经在右边那张卡上了"); }
           pick(row, u.text, id, i, speaker, index);
         };
+        if (cards) {
+          const tag = document.createElement("span");
+          tag.className = "km-tag"; tag.textContent = "✓ 已入库";
+          row.appendChild(tag);
+        }
       });
       scrollDown();
     }).catch(e => toast("拆句失败：" + e.message));
   }
 
-  async function pick(row, text, message, index, speaker, turn) {
-    row.classList.add("busy");
+  // @param marker - 表格里被点的那一行/那一格：它自己标成已入库，而不是把整张表标了
+  async function pick(row, text, message, index, speaker, turn, note, marker) {
+    if (marker) marker.classList.add("busy"); else row.classList.add("busy");
     try {
       const out = await api("POST", forChat("pick"), {
         text, title: "",
         origin: { kind: "codex", session: S.chat, message, index, turn, speaker,
                   question: S.turns[turn] ? S.turns[turn].q : "", cwd: S.cwd },
       });
-      row.classList.add("picked");
-      if (!row.querySelector(".km-tag")) {
-        const tag = document.createElement("span");
-        tag.className = "km-tag"; tag.textContent = "✓ 已入库";
-        row.appendChild(tag);
+      if (marker && marker !== row) {
+        marker.classList.remove("busy");
+        marker.classList.add("picked");
+      } else {
+        row.classList.add("picked");
+        if (!row.querySelector(".km-tag")) {
+          const tag = document.createElement("span");
+          tag.className = "km-tag"; tag.textContent = "✓ 已入库";
+          row.appendChild(tag);
+        }
       }
       const box = S.picked.get(message) || {};
       (box[text] = box[text] || []).push(out.id);
       S.picked.set(message, box);
       tellGraph({ type: "refresh", card: out.id });
-      toast("挂上了：" + out.title);
+      toast("挂上了：" + out.title + (note ? "（" + note + "）" : ""));
     } catch (e) { toast("没挂上：" + e.message); }
-    finally { row.classList.remove("busy"); }
+    finally { if (marker) marker.classList.remove("busy"); else row.classList.remove("busy"); }
   }
 
   // Which sentences of a turn are already cards, so a reload keeps the marks.
