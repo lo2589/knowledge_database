@@ -231,8 +231,20 @@
     if (!box) return;
     const n = S.hitList.length;
     box.textContent = n ? `${S.hitIndex + 1} / ${n}` : "";
+    // 折叠起来的分支照样算命中：把它们数出来，别让人以为"搜不到"
+    const hidden = n ? S.hitList.filter(h => h.kind === "card" && ancestorFolded(h.id)).length : 0;
+    box.title = n ? (hidden ? `共 ${n} 处命中，其中 ${hidden} 处在折叠的分支里（回车跳过去会自动展开）`
+                            : `共 ${n} 处命中`) : "";
     $("hit-prev").disabled = !n;
     $("hit-next").disabled = !n;
+  }
+
+  // 这张卡是不是藏在某个折起来的分支里
+  function ancestorFolded(id) {
+    for (let p = node(id) && node(id).parent; p != null; p = node(p).parent) {
+      if (S.closedChildren.has(p) || S.closedTrees.has(p)) return true;
+    }
+    return false;
   }
 
   // ------------------------------------------------------------- drawing

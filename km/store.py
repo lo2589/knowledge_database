@@ -426,6 +426,12 @@ class KnowledgeStore:
             return self._card(cid)
 
     def cards(self, q: str = "") -> list[dict]:
+        """Cards matching a query, for pickers (relations, anywhere that searches).
+
+        The same fields the board searches: title, body, every origin sentence and
+        the check note — a word you left in 「原文」 or 「核对依据」 must not be
+        invisible just because it is not in the title.
+        """
         with self.lock:
             res = self.db.query({"predicate": {"op": "eq", "field": "@type", "value": "card"},
                                  "order_by": {"field": "/updated", "direction": "desc"},
@@ -434,7 +440,13 @@ class KnowledgeStore:
             out = []
             for n in res["nodes"]:
                 a = n["attrs"]
-                hay = (a["title"] + "\n" + a["body"]).lower()
+                origins = ""
+                for l in self._links(n["id"])["out"]:
+                    if l["relation"] == "from_unit":
+                        u = self.db.get(l["id"], links="none")
+                        if u is not None:
+                            origins += "\n" + u["attrs"].get("text", "")
+                hay = "\n".join([a["title"], a["body"], a.get("check_note", ""), origins]).lower()
                 if all(t in hay for t in terms):
                     links = self._links(n["id"])
                     degree = sum(1 for l in links["out"] + links["in"] if l["relation"] in RELATIONS)

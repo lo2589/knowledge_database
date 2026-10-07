@@ -297,6 +297,16 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([u["status"] for u in self.s.units(self.sid) if u["id"] in picked], ["kept"] * len(picked))
         self.assertEqual([n for n in self.s.canvas()["nodes"] if n != self.s.root], [card["id"]])
 
+    def test_a_picker_finds_a_word_that_only_lives_in_原文_or_核对依据(self):
+        # 关系选择器、任何按词找卡的地方：标题正文之外，「原文」和「核对依据」也要算
+        card = self.s.create_card("", self.units[2]["text"], [self.units[2]["id"]])
+        self.s.update_card(card["id"], body="正文改写过了，原词不在这里。")
+        self.assertEqual([c["id"] for c in self.s.cards("第一句")], [card["id"]])
+        other = self.s.create_card("另一张", "随便写点。", [])
+        self.s.check_card(other["id"], "ok", "对照了论文里的 zeppelin 一节")
+        self.assertEqual([c["id"] for c in self.s.cards("zeppelin")], [other["id"]])
+        self.assertEqual(self.s.cards("哪里都没有的词"), [])
+
     def test_cards_links_and_graph(self):
         c1 = self.s.create_card("", "梯度 $\\nabla$", [self.units[2]["id"]])
         c2 = self.s.create_card("主题", "优化", [])
