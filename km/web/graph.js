@@ -81,7 +81,7 @@
       localStorage.setItem(stateKey(), JSON.stringify({
         // The version guards against a layout change handing back a view that
         // was remembered for a different geometry.
-        v: 5, mode: S.mode, view: S.view, viewTarget: S.viewTarget, needFit: !!S.needFit, selected: S.selected,
+        v: 6, mode: S.mode, view: S.view, viewTarget: S.viewTarget, needFit: !!S.needFit, selected: S.selected,
         closedChildren: [...S.closedChildren], closedTrees: [...S.closedTrees],
         closedRelations: [...S.closedRelations], originsOpen: [...S.originsOpen],
         opened: [...S.opened], manualClosed: [...S.manualClosed],
@@ -103,7 +103,7 @@
     if (raw && (raw.mode === "map" || raw.mode === "outline")) S.mode = raw.mode;
     S.outlineClosed = raw && raw.outlineClosed !== undefined ? !!raw.outlineClosed : EMBEDDED;
     if (raw && raw.q && $("search")) $("search").value = raw.q;
-    const fresh = raw && raw.v === 5;   // a view from an older framing is not this framing
+    const fresh = raw && raw.v === 6;   // a view from an older framing is not this framing
     // 记下这个视图是冲着哪个挂载点摆的：换了挂载点就不能拿它当数
     S.viewTarget = raw && Number.isFinite(raw.viewTarget) ? raw.viewTarget : null;
     S.view = fresh && raw.view && Number.isFinite(raw.view.k) && raw.view.k > 0
@@ -244,6 +244,11 @@
   // 画面空着，再把最近的卡一张张拉进来——但绝不为此把画面缩到读不清。
   const NEIGHBOUR_FLOOR = 0.5;   // 为了邻卡、为了填空，最多缩到这里
   const ACTIVE_FLOOR = 0.32;     // 活跃节点和它的子节点必须完整，可以缩到这里
+  // 手动摆一张卡，最远只能离它在树上的位置这么远（层坐标）：拖到这里就到底。
+  const DRAG_MAX = 1200;
+  // 离树上的位置超过这么远，就当作"被摆到几千像素外"（老数据、或别处写进去的坐标），
+  // 直接拉回树上。它比能拖到的距离大，所以正常拖动不会被自己拉回来。
+  const STRAY_MAX = 1800;
 
   // 取景规则，一条一条，别互相打架：
   //   ① 活跃那张卡 + 它树上的全部子节点，永远完整在画面里（为此可以缩到 ACTIVE_FLOOR）；
@@ -282,7 +287,7 @@
     if (!kidsEls.length && n.parent != null) box = union(box, rectOf(layer.querySelector(`.node[data-id="${n.parent}"]`)));
     k = Math.max(ACTIVE_FLOOR, fitK(box));
     place();
-    // 被手动摆到很远的孩子：能一起看清就带上
+    // 手动摆过位置的孩子：能一起看清就带上（摆放最远只有 STRAY_MAX，所以这一般都成立）
     const pinned = kidsEls.filter(el => !onTree.includes(el));
     for (const el of pinned) {
       const kk = Math.max(ACTIVE_FLOOR, fitK(union(box, rectOf(el))));
@@ -328,6 +333,14 @@
     place();
   }
 
+  // 手动摆到很远的卡片被拉回树上之后，得让服务端也知道它现在是树上的位置，否则下次
+  // 打开它又飘在那边。一次说一句就够，不要每张卡弹一次。
+  function pullBack(ids) {
+    ids.forEach(id => api("POST", `cards/${id}/place`, { x: null, y: null }).catch(() => {}));
+    say(ids.length === 1 ? `有 1 张卡被摆到了家族很远处，已经拉回树上`
+                         : `有 ${ids.length} 张卡被摆到了家族很远处，已经拉回树上`, false);
+  }
+
   function focusActive() {
     focusOn(S.data && S.data.target);
     paintTarget();
@@ -347,7 +360,7 @@
       return r.right < st.left - 4 || r.left > st.right + 4 || r.bottom < st.top - 4 || r.top > st.bottom + 4;
     });
     label.innerHTML = `新知识挂到：<b>${esc(node(id).title)}</b>` + (stray.length
-      ? ` <span class="stray" title="它们被手动摆到了很远的地方。点「自适应」会把摆过的卡片收回树上，然后就看得到了">⚠ ${stray.length} 个子节点在画面外</span>`
+      ? ` <span class="stray" title="它们被摆到了画面外。点「自适应」会把摆过的卡片收回树上，然后就看得到了">⚠ ${stray.length} 个子节点在画面外</span>`
       : "");
     label.title = "点这里：把画面带回这一段（活跃的分支）";
     label.style.cursor = "pointer";
@@ -778,9 +791,15 @@
 
   // Tidy top-down tree, the way the whole thing was designed: each subtree as
   // wide as it needs, parents centred over their children, each level below the
-  // tallest box of the level above. Siblings stay side by side — a tree that has
-  // been broken into rows reads as two pictures, not one.
+  // tallest box of the level above.
+  //
+  // 一排是没有无限长的。一层里兄弟一多，一张挨一张排下去就能横出去几千像素
+  // （84d106 全部展开是 11 857px 宽，60 张里 45 张在画面外）：那不是"几何上装不下"，
+  // 是排得不对。所以一行排到 ROW_MAX 就折行，下一家的卡片接着往下排，一家人整块
+  // 搬下去，不拆两半。宽度因此有上限，树高一点不要紧。
+  const ROW_GAP_K = 0.5;
   let pos = {};
+  let treePos = {};      // 树上的位置（不含手动摆放）：手动摆放的合法范围以它为准
   function layout(vis, srcs) {
     const layer = $("layer"), box = id => layer.querySelector(`.node[data-id="${id}"]`);
     // Only what is on screen takes part in the layout: a folded subtree must not
@@ -788,28 +807,118 @@
     // up far apart and every edge stretches across the gap.
     const folded = id => S.closedChildren.has(id) || S.closedTrees.has(id);
     const shown = id => (folded(id) ? [] : node(id).children);
-    const sub = new Map();
-    (function measure(id) {
-      const c = shown(id); c.forEach(measure);
-      const cw = c.reduce((a, x) => a + sub.get(x), 0) + Math.max(0, c.length - 1) * HGAP;
-      sub.set(id, Math.max(width(id), cw));
+    // 一行最多这么宽：四张卡起步，屏幕上放得下一屏半。再宽就该折行了。
+    const ROW_MAX = Math.max(4 * (W_OPEN + HGAP), Math.round(paneWidth() * 1.5));
+    const ROW_GAP = Math.round(VGAP * ROW_GAP_K);
+    const hOf = id => box(id).offsetHeight;
+
+    // 一层一层排。一层里的卡片按树上的家族顺序排成行，一行排到 ROW_MAX 就折行；
+    // 折行只影响"这一层分成几行"，层与层之间照样一层压一层，父母还是摆在自己孩子
+    // 上方的中间。
+    const lvIds = [];
+    (function walk(id) {
+      const l = node(id).level;
+      (lvIds[l] = lvIds[l] || []).push(id);
+      shown(id).forEach(walk);
     })(S.data.root);
-    const lvH = [];
-    vis.forEach(id => { const l = node(id).level; lvH[l] = Math.max(lvH[l] || 0, box(id).offsetHeight); });
-    const lvY = [0];
-    for (let l = 1; l < lvH.length; l++) lvY[l] = lvY[l - 1] + lvH[l - 1] + VGAP;
-    pos = {};
-    (function place(id, x0) {
-      const c = shown(id), y = lvY[node(id).level];
-      if (!c.length) { pos[id] = { x: x0 + (sub.get(id) - width(id)) / 2, y }; return; }
-      const cw = c.reduce((a, x) => a + sub.get(x), 0) + (c.length - 1) * HGAP;
-      let x = x0 + (sub.get(id) - cw) / 2;
-      c.forEach(k => { place(k, x); x += sub.get(k) + HGAP; });
-      const f = pos[c[0]], l = pos[c[c.length - 1]];
-      pos[id] = { x: (f.x + width(c[0]) / 2 + l.x + width(c[c.length - 1]) / 2) / 2 - width(id) / 2, y };
-    })(S.data.root, 0);
-    // A card dropped by hand keeps where it was put; the rest stay a strict tree.
-    vis.forEach(id => { const n = node(id); if (n.x != null && n.y != null) pos[id] = { x: n.x, y: n.y }; });
+    const lvRows = [], lvTop = [], lvH = [];
+    lvIds.forEach(ids => {
+      const rows = [];
+      let row = null;
+      const add = (id, cw) => {
+        if (!row || row.w + HGAP + cw > ROW_MAX) { row = { ids: [], w: 0 }; rows.push(row); }
+        row.w += (row.ids.length ? HGAP : 0) + cw; row.ids.push(id);
+      };
+      // 同一家的孩子尽量排在一行不动：一家人整块搬下去，不拆成两半。
+      for (let i = 0; i < (ids || []).length;) {
+        let j = i;
+        while (j + 1 < ids.length && node(ids[j + 1]).parent === node(ids[i]).parent) j++;
+        const group = ids.slice(i, j + 1);
+        const gw = group.reduce((a, id) => a + width(id), 0) + (group.length - 1) * HGAP;
+        if (gw <= ROW_MAX) {
+          if (!row || row.w + HGAP + gw > ROW_MAX) { row = { ids: [], w: 0 }; rows.push(row); }
+          group.forEach(id => { row.w += (row.ids.length ? HGAP : 0) + width(id); row.ids.push(id); });
+        } else {
+          group.forEach(id => add(id, width(id)));   // 一家自己就超过一行：只能按卡片折
+        }
+        i = j + 1;
+      }
+      lvRows.push(rows);
+    });
+    const boardW = Math.max(0, ...lvRows.map(rows => Math.max(0, ...rows.map(r => r.w))));
+    lvRows.forEach((rows, l) => {
+      lvH[l] = rows.reduce((a, r) => a + Math.max(...r.ids.map(hOf)), 0) + Math.max(0, rows.length - 1) * ROW_GAP;
+      lvTop[l] = l ? lvTop[l - 1] + lvH[l - 1] + VGAP : 0;
+    });
+
+    pos = {}; treePos = {};
+    const x = new Map(), y = new Map();
+    lvRows.forEach((rows, l) => {
+      let ry = lvTop[l];
+      rows.forEach(r => {
+        let cx = (boardW - r.w) / 2;
+        r.ids.forEach(id => { x.set(id, cx); y.set(id, ry); cx += width(id) + HGAP; });
+        ry += Math.max(...r.ids.map(hOf)) + ROW_GAP;
+      });
+    });
+    // 父母挪到自己孩子的上方中间。左右各走一趟，走的时候不许压到同层的兄弟，
+    // 否则一个大家庭的中间会把旁边的卡片顶开。
+    const kidCentre = id => {
+      const kids = shown(id).filter(k => x.has(k));
+      if (!kids.length) return null;
+      const a = Math.min(...kids.map(k => x.get(k)));
+      const b = Math.max(...kids.map(k => x.get(k) + width(k)));
+      return (a + b) / 2 - width(id) / 2;
+    };
+    for (let pass = 0; pass < 2; pass++) {
+      for (let l = lvRows.length - 2; l >= 0; l--) {
+        (lvRows[l] || []).forEach(row => {
+          const ids = row.ids, want = ids.map(kidCentre);
+          for (let i = 0; i < ids.length; i++) {                        // 左 → 右
+            const mine = want[i] == null ? x.get(ids[i]) : want[i];
+            x.set(ids[i], i === 0 ? mine : Math.max(mine, x.get(ids[i - 1]) + width(ids[i - 1]) + HGAP));
+          }
+          for (let i = ids.length - 1; i >= 0; i--) {                    // 右 → 左
+            const limit = i === ids.length - 1 ? Infinity : x.get(ids[i + 1]) - width(ids[i]) - HGAP;
+            x.set(ids[i], Math.min(x.get(ids[i]), limit));
+          }
+          for (let i = 1; i < ids.length; i++) {                         // 再把间距补回来
+            x.set(ids[i], Math.max(x.get(ids[i]), x.get(ids[i - 1]) + width(ids[i - 1]) + HGAP));
+          }
+        });
+      }
+    }
+    // 挪动归挪动，一层就是 ROW_MAX 宽：被撑宽的行按比例收回它原来那一行里去，
+    // 每行再回到同一条中轴上。宽度有了硬上限，"几千像素外"不可能再出现。
+    lvRows.forEach(rows => rows.forEach(r => {
+      const ids = r.ids;
+      if (!ids.length) return;
+      const a = Math.min(...ids.map(id => x.get(id)));
+      const b = Math.max(...ids.map(id => x.get(id) + width(id)));
+      if (b - a > r.w && b - a > 0) {
+        const s = r.w / (b - a), c = (a + b) / 2;
+        ids.forEach(id => x.set(id, c + (x.get(id) - c) * s));
+      }
+      const a2 = Math.min(...ids.map(id => x.get(id)));
+      const b2 = Math.max(...ids.map(id => x.get(id) + width(id)));
+      const d = boardW / 2 - (a2 + b2) / 2;
+      if (d) ids.forEach(id => x.set(id, x.get(id) + d));
+    }));
+    const shift = Math.min(...[...x.values()], 0) * -1;
+    vis.forEach(id => { if (x.has(id)) treePos[id] = { x: x.get(id) + shift, y: y.get(id) }; });
+    // A card dropped by hand keeps where it was put — 只要那个位置还在它家族旁边。
+    // 摆到几千像素外的：画面不该为了它缩到看不清，直接拉回树上（并且告诉服务端），
+    // 所以下次打开它也不会再飘在那边。
+    const pulled = [];
+    vis.forEach(id => {
+      const n = node(id), t = treePos[id];
+      if (!t) return;
+      pos[id] = { x: t.x, y: t.y };
+      if (n.x == null || n.y == null) return;
+      if (Math.hypot(n.x - t.x, n.y - t.y) > STRAY_MAX) { n.x = null; n.y = null; pulled.push(id); return; }
+      pos[id] = { x: n.x, y: n.y };
+    });
+    if (pulled.length) pullBack(pulled);
     vis.forEach(id => { const b = box(id); b.style.left = pos[id].x + "px"; b.style.top = pos[id].y + "px"; });
 
     // imported sources: a column to the left of the tree
@@ -1238,6 +1347,20 @@
       // The card follows the pointer: every node can be put anywhere.
       const k = S.view.k || 1;
       drag.at = { x: drag.from.x + (ev.clientX - sx) / k, y: drag.from.y + (ev.clientY - sy) / k };
+      // 只在家族旁边活动：一张卡被拖到几千像素外，画面就得为它缩到看不清，所以到头
+      // 就是到头——卡片停在墙上，而不是先让你扔出去、以后再抱怨装不下。
+      const t = treePos[id];
+      if (t) {
+        const dx = drag.at.x - t.x, dy = drag.at.y - t.y, d = Math.hypot(dx, dy);
+        if (d > DRAG_MAX) {
+          drag.at.x = t.x + (dx / d) * DRAG_MAX;
+          drag.at.y = t.y + (dy / d) * DRAG_MAX;
+          if (!S.wallTold) {
+            S.wallTold = true;
+            say(`卡片最远摆到离家族 ${DRAG_MAX} 像素的地方，再远这一段就装不下了`, false);
+          }
+        }
+      }
       el.style.left = drag.at.x + "px"; el.style.top = drag.at.y + "px";
       el.style.pointerEvents = "none";
       document.querySelectorAll(".node.drop-in, .node.drop-before, .node.drop-after").forEach(x => x.classList.remove("drop-in", "drop-before", "drop-after"));
