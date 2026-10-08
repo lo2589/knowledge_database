@@ -50,8 +50,9 @@
     closedRelations: new Set(), closedChildren: new Set(), closedTrees: new Set(), selectedRef: null, relAdding: null,
     selected: null, mergeArmed: null, linkFrom: null, originsOpen: new Set(), hitList: [], hitIndex: -1, hitQuery: null,
     // 平时只展开「活跃节点 + 它的子节点」这一块：不活跃的子树折起来，兄弟才会挨在一起，
-    // 活跃节点和它的子节点才装得进画面。手动展开过的分支记在这里，自动折叠不再动它。
-    opened: new Set(),
+    // 活跃节点和它的子节点才装得进画面。你自己展开过（opened）、自己折起来过
+    // （manualClosed）的分支，自动规则一律不动。
+    opened: new Set(), manualClosed: new Set(),
     outlineClosed: EMBEDDED,
     // The graph opens on the hierarchy map itself — the tree drawn top-down is
     // the product surface. The Outliner is one click away on the mode button.
@@ -80,9 +81,10 @@
       localStorage.setItem(stateKey(), JSON.stringify({
         // The version guards against a layout change handing back a view that
         // was remembered for a different geometry.
-        v: 4, mode: S.mode, view: S.view, needFit: !!S.needFit, selected: S.selected,
+        v: 5, mode: S.mode, view: S.view, viewTarget: S.viewTarget, needFit: !!S.needFit, selected: S.selected,
         closedChildren: [...S.closedChildren], closedTrees: [...S.closedTrees],
-        closedRelations: [...S.closedRelations], originsOpen: [...S.originsOpen], opened: [...S.opened],
+        closedRelations: [...S.closedRelations], originsOpen: [...S.originsOpen],
+        opened: [...S.opened], manualClosed: [...S.manualClosed],
         outlineClosed: S.outlineClosed, q: $("search") ? $("search").value : "",
       }));
     } catch (e) { /* a full or blocked store must never break the board */ }
@@ -96,11 +98,14 @@
     S.closedRelations = numSet(raw && raw.closedRelations);
     S.originsOpen = numSet(raw && raw.originsOpen);
     S.opened = numSet(raw && raw.opened);
+    S.manualClosed = numSet(raw && raw.manualClosed);
     S.selected = raw && Number.isFinite(raw.selected) ? raw.selected : null;
     if (raw && (raw.mode === "map" || raw.mode === "outline")) S.mode = raw.mode;
     S.outlineClosed = raw && raw.outlineClosed !== undefined ? !!raw.outlineClosed : EMBEDDED;
     if (raw && raw.q && $("search")) $("search").value = raw.q;
-    const fresh = raw && raw.v === 4;   // a view from an older framing is not this framing
+    const fresh = raw && raw.v === 5;   // a view from an older framing is not this framing
+    // 记下这个视图是冲着哪个挂载点摆的：换了挂载点就不能拿它当数
+    S.viewTarget = raw && Number.isFinite(raw.viewTarget) ? raw.viewTarget : null;
     S.view = fresh && raw.view && Number.isFinite(raw.view.k) && raw.view.k > 0
       ? { k: raw.view.k, x: raw.view.x || 0, y: raw.view.y || 0 } : null;
     // No remembered place: aim at the active branch rather than the whole map.
@@ -160,6 +165,8 @@
     // yanking the canvas to the first one.
     if ($("search").value.trim() && !S.hitList.length) refreshHits();
     if (!S.foldedOnce) { S.foldedOnce = true; foldToActive(); }
+    // 上次那个视图是冲着别的挂载点摆的：那它对这个挂载点不作数，重新取景
+    if (S.view && S.viewTarget !== S.data.target) S.needFocus = true;
     render();
     if (focus && node(focus)) { showNew(focus); }
   }
@@ -168,6 +175,8 @@
     for (let p = node(id) && node(id).parent; p != null; p = node(p).parent) {
       S.closedChildren.delete(p);
       S.closedTrees.delete(p);
+      S.opened.add(p);
+      S.manualClosed.delete(p);
     }
   }
 
@@ -220,15 +229,27 @@
     let changed = false;
     Object.values(S.data.nodes).forEach(n => {
       if (!n.children.length) return;
-      const keepOpen = path.has(n.id) || S.opened.has(n.id);
+      // 你自己折起来的：听你的。活跃那条路径 / 你展开过的：打开（换挂载点时要跟着开）。
+      const keepOpen = !S.manualClosed.has(n.id) && (path.has(n.id) || S.opened.has(n.id));
       const was = S.closedChildren.has(n.id);
-      if (!keepOpen && !was) { S.closedChildren.add(n.id); changed = true; }
+      if (keepOpen === was) {
+        if (keepOpen) { S.closedChildren.delete(n.id); changed = true; }
+        else { S.closedChildren.add(n.id); changed = true; }
+      }
     });
     return changed;
   }
 
   // 取景：活跃的那张卡和它的**全部子节点**必须都在画面里（这是硬要求），然后为了不让
   // 画面空着，再把最近的卡一张张拉进来——但绝不为此把画面缩到读不清。
+  const NEIGHBOUR_FLOOR = 0.5;   // 为了邻卡、为了填空，最多缩到这里
+  const ACTIVE_FLOOR = 0.32;     // 活跃节点和它的子节点必须完整，可以缩到这里
+
+  // 取景规则，一条一条，别互相打架：
+  //   ① 活跃那张卡 + 它树上的全部子节点，永远完整在画面里（为此可以缩到 ACTIVE_FLOOR）；
+  //   ② 画面边上露了半张的卡，能整张收进来就收，但为此不缩过 NEIGHBOUR_FLOOR；
+  //   ③ 画面还空（内容盖不到 45%），把最近的卡一张张拉进来，同样不缩过 NEIGHBOUR_FLOOR；
+  //   ④ 这一块装得下就居中，装不下就贴左上，别的分支自然落在画面外。
   function focusOn(id) {
     const st = $("stage"), layer = $("layer");
     const seed = layer.querySelector(`.node[data-id="${id}"]`);
@@ -242,42 +263,69 @@
     const fitK = box => Math.min(1, W / Math.max(1, box.w), H / Math.max(1, box.h));
     const fillOf = (box, k) => (Math.min(W, box.w * k) / W) * (Math.min(H, box.h * k) / H);
 
+    let box, k;
+    const place = () => {
+      const w = box.w * k, h = box.h * k;
+      const x = w <= st.clientWidth - pad * 2 ? (st.clientWidth - w) / 2 - box.x * k : pad - box.x * k;
+      const y = h <= st.clientHeight - pad * 2 ? (st.clientHeight - h) / 2 - box.y * k : pad - box.y * k;
+      S.view = { k, x, y };
+      S.viewTarget = id;
+      applyView();
+    };
+    // ① 活跃的卡 + 它树上的全部子节点
     const start = rectOf(seed);
-    // ① 活跃的卡 + 它展开着的子节点：尽量一个都不能少
     const n = node(id);
-    let box = { x: start.x, y: start.y, w: start.w, h: start.h };
+    box = { x: start.x, y: start.y, w: start.w, h: start.h };
     const kidsEls = n.children.map(c => layer.querySelector(`.node[data-id="${c}"]`)).filter(Boolean);
-    // 树上的孩子先全进来；被手动摆到很远的孩子，只有当"拉进来还看得清"时才进
     const onTree = kidsEls.filter(el => S.data.nodes[+el.dataset.id].x == null && S.data.nodes[+el.dataset.id].y == null);
-    const pinned = kidsEls.filter(el => !onTree.includes(el));
     onTree.forEach(el => { box = union(box, rectOf(el)); });
-    // 叶子卡就把它上面一层带上，别让它孤零零悬在空白里
     if (!kidsEls.length && n.parent != null) box = union(box, rectOf(layer.querySelector(`.node[data-id="${n.parent}"]`)));
-    // 装下这一块要求的尺度可以低于平时的可读下限——"孩子必须看得见"优先
-    const FLOOR = 0.32;
-    let k = Math.max(FLOOR, fitK(box));
+    k = Math.max(ACTIVE_FLOOR, fitK(box));
+    place();
+    // 被手动摆到很远的孩子：能一起看清就带上
+    const pinned = kidsEls.filter(el => !onTree.includes(el));
     for (const el of pinned) {
-      const grown = union(box, rectOf(el));
-      const kk = Math.max(FLOOR, fitK(grown));
-      if (kk < MIN_K) break;              // 拉进来就要缩得看不清，那就不拉：另有提示
-      box = grown; k = kk;
+      const kk = Math.max(ACTIVE_FLOOR, fitK(union(box, rectOf(el))));
+      if (kk < NEIGHBOUR_FLOOR) break;
+      box = union(box, rectOf(el)); k = kk;
     }
-
-    // ② 画面还空，就一张张加最近的卡；但为此缩放不许低于 MIN_K（宁可留白，不缩小到读不清）
+    // ② 边上露了半张的卡，一起收进来
+    const growBy = targets => {
+      let next = box;
+      targets.forEach(el => { next = union(next, rectOf(el)); });
+      if (next === box) return false;
+      const kk = Math.max(ACTIVE_FLOOR, fitK(next));
+      if (kk < NEIGHBOUR_FLOOR) return false;
+      box = next; k = kk;
+      return true;
+    };
+    const cards = els.filter(el => el.classList.contains("node"));
+    const clippedNow = () => {
+      const s2 = $("stage").getBoundingClientRect();
+      return cards.filter(el => {
+        const r = el.getBoundingClientRect();
+        const whole = r.left >= s2.left - 1 && r.right <= s2.right + 1 && r.top >= s2.top - 1 && r.bottom <= s2.bottom + 1;
+        const touches = r.right > s2.left + 1 && r.left < s2.right - 1 && r.bottom > s2.top + 1 && r.top < s2.bottom - 1;
+        return touches && !whole;
+      });
+    };
+    for (let round = 0; round < 3; round++) {
+      if (!growBy(clippedNow())) break;
+      place();
+    }
+    // ③ 画面还空就拉最近的卡进来
     const cx = start.x + start.w / 2, cy = start.y + start.h / 2;
     const others = els.filter(el => el !== seed).map(rectOf)
       .sort((a, b) => Math.hypot(a.x + a.w / 2 - cx, a.y + a.h / 2 - cy) - Math.hypot(b.x + b.w / 2 - cx, b.y + b.h / 2 - cy));
     for (const r of others) {
       if (fillOf(box, k) >= 0.45) break;
-      const grown = union(box, r);
-      const kk = Math.max(FLOOR, fitK(grown));
-      if (kk < MIN_K) break;                 // 再加上去就要缩得看不清了，停
-      box = grown; k = kk;
+      const kk = Math.max(ACTIVE_FLOOR, fitK(union(box, r)));
+      if (kk < NEIGHBOUR_FLOOR) break;
+      box = union(box, r); k = kk;
     }
     S.needFit = false;
     S.needFocus = false;
-    S.view = { k, x: pad - box.x * k, y: pad - box.y * k };
-    applyView();
+    place();
   }
 
   function focusActive() {
@@ -1259,9 +1307,11 @@
       const id = S.data && S.data.target;
       const spot = id != null && pos[id] ? { x: pos[id].x + width(id) / 2, y: pos[id].y } : { x: minX + bw / 2, y: minY };
       S.view = { k: MIN_K, x: st.clientWidth / 2 - spot.x * MIN_K, y: 56 - spot.y * MIN_K };
+      S.viewTarget = S.data ? S.data.target : null;
       return applyView();
     }
     S.view = { k, x: st.clientWidth / 2 - (minX + bw / 2) * k, y: st.clientHeight / 2 - (minY + bh / 2) * k };
+    S.viewTarget = S.data ? S.data.target : null;
     applyView();
   }
   // 自适应: put a card that was dragged somewhere by hand back on the tree, then
