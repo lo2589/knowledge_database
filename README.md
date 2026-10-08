@@ -13,7 +13,7 @@
 
 为什么结构要自己挂、不让 AI 自动挂：AI 画的结构图更整齐，但人记不住；自己挂的更乱，记得反而牢。挂的这一下就是学习。
 
-完整需求清单和完成情况见 [REQUIREMENTS.md](REQUIREMENTS.md)，功能对照见 [FEATURES.md](FEATURES.md)。
+（需求清单、功能对照这类工作笔记留在本地，不随仓库发布。）
 
 ---
 
@@ -337,8 +337,6 @@ dsh-plugin-known-manage/
   cordis.patch.yml 插件挂载点
   test/            node --test 用的测试
 tests/             Python 单测 + 右栏 slot 测试
-REQUIREMENTS.md    需求清单和完成情况（逐条对应你提的要求）
-FEATURES.md        Mermaid / XMind 功能对照与改造清单
 ```
 
 ### HTTP 接口一览（都在 `127.0.0.1`，库相关的一律要带 `?s=<会话 id>`）

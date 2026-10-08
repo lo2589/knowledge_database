@@ -13,8 +13,16 @@ import { fileURLToPath } from 'node:url'
 
 const HERE = path.dirname(fileURLToPath(import.meta.url))
 const PLUGIN = path.join(HERE, '..', 'dsh-plugin-known-manage')
-const DSH = process.env.DSH_REPO || '../deepseek-harness'
-const { SlotCore } = await import(path.join(DSH, 'packages/client/ui-slots/src/index.ts'))
+// The harness checkout sits next to this repository by default; DSH_REPO points
+// anywhere else. Without it there is nothing to mount into, so the test skips
+// instead of failing on a machine that only has this repository.
+const DSH = process.env.DSH_REPO || path.join(HERE, '..', '..', 'deepseek-harness')
+const ENTRY = path.join(DSH, 'packages/client/ui-slots/src/index.ts')
+if (!fs.existsSync(ENTRY)) {
+  console.log(`skip  没找到 dsh 检出（${DSH}）；设 DSH_REPO=/path/to/deepseek-harness 再跑`)
+  process.exit(0)
+}
+const { SlotCore } = await import(ENTRY)
 
 let failed = 0
 const check = (name, fn) => {
